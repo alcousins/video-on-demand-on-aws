@@ -32,3 +32,5 @@ codescan-unified-default.sh
 **/source/test
 **source/**/.coverage
 **source/**/coverage
+
+source/mediainfo/bin/mediainfo
