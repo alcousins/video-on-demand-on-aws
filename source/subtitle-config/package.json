@@ -1,0 +1,23 @@
+{
+  "name": "subtitle-config",
+  "version": "6.0.0",
+  "description": "Video on Demand on AWS - Subtitle Configuration Lambda",
+  "main": "index.js",
+  "author": {
+    "name": "Amazon Web Services",
+    "url": "https://aws.amazon.com/solutions"
+  },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.370.0",
+    "@aws-sdk/client-s3": "^3.370.0",
+    "@aws-sdk/client-sns": "^3.370.0",
+    "@aws-sdk/lib-dynamodb": "^3.370.0"
+  },
+  "devDependencies": {
+    "jest": "^29.5.0"
+  },
+  "scripts": {
+    "test": "jest --coverage"
+  }
+}

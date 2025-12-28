@@ -47,7 +47,7 @@ exports.handler = async (event) => {
                 response = 'success';
                 break;
 
-            case event.hasOwnProperty('guid'):
+            case event.hasOwnProperty('guid') && !event.hasOwnProperty('subtitleTrigger'):
                 // Process Workflow trigger
                 params = {
                     stateMachineArn: process.env.ProcessWorkflow,
@@ -55,6 +55,16 @@ exports.handler = async (event) => {
                         guid: event.guid
                     }),
                     name: event.guid
+                };
+                response = 'success';
+                break;
+
+            case event.hasOwnProperty('guid') && event.hasOwnProperty('subtitleTrigger'):
+                // Subtitle Processor Workflow trigger (after MediaConvert job submission)
+                params = {
+                    stateMachineArn: process.env.SubtitleProcessorWorkflow,
+                    input: JSON.stringify(event),
+                    name: `${event.guid}-subtitle`
                 };
                 response = 'success';
                 break;

@@ -1,0 +1,26 @@
+{
+  "name": "video-on-demand-integration-tests",
+  "version": "1.0.0",
+  "description": "Integration tests for Video on Demand subtitle processing workflow",
+  "main": "index.js",
+  "scripts": {
+    "test": "mocha --recursive --timeout 10000",
+    "test:subtitle": "mocha subtitle-workflow-integration.test.js --timeout 10000"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/client-sfn": "^3.0.0",
+    "@aws-sdk/client-lambda": "^3.0.0",
+    "@aws-sdk/client-sns": "^3.0.0",
+    "@aws-sdk/client-sqs": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "aws-sdk-client-mock": "^4.0.0",
+    "chai": "^4.3.0",
+    "mocha": "^10.0.0",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {},
+  "author": "AWS Solutions",
+  "license": "Apache-2.0"
+}

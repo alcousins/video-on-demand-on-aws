@@ -26,8 +26,11 @@ import * as sfn from 'aws-cdk-lib/aws-stepfunctions';
 import * as tasks from 'aws-cdk-lib/aws-stepfunctions-tasks';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import { CloudFrontToS3 } from '@aws-solutions-constructs/aws-cloudfront-s3';
 import { NagSuppressions } from 'cdk-nag';
+import * as fs from 'fs';
+import * as path from 'path';
 
 export class VideoOnDemand extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -90,6 +93,22 @@ export class VideoOnDemand extends cdk.Stack {
       default: 'PREFERRED',
       allowedValues: ['ENABLED', 'DISABLED', 'PREFERRED']
     });
+    const enableSubtitleProcessing = new cdk.CfnParameter(this, 'EnableSubtitleProcessing', {
+      type: 'String',
+      description: 'Enable automatic subtitle generation and translation for uploaded videos',
+      default: 'No',
+      allowedValues: ['Yes', 'No']
+    });
+    const subtitlePrimaryLanguage = new cdk.CfnParameter(this, 'SubtitlePrimaryLanguage', {
+      type: 'String',
+      description: 'Primary language for subtitle transcription (use "auto" for automatic detection)',
+      default: 'auto'
+    });
+    const subtitleTargetLanguages = new cdk.CfnParameter(this, 'SubtitleTargetLanguages', {
+      type: 'CommaDelimitedList',
+      description: 'Target languages for subtitle translation (comma-separated list: en,es,fr,de,it,pt,ja,ko,zh,ar)',
+      default: 'en'
+    });
     /**
      * Template metadata
      */
@@ -116,6 +135,14 @@ export class VideoOnDemand extends cdk.Stack {
           {
             Label: { default: 'AWS Elemental MediaPackage' },
             Parameters: [enableMediaPackage.logicalId]
+          },
+          {
+            Label: { default: 'Subtitle Processing' },
+            Parameters: [
+              enableSubtitleProcessing.logicalId,
+              subtitlePrimaryLanguage.logicalId,
+              subtitleTargetLanguages.logicalId
+            ]
           }
         ],
         ParameterLabels: {
@@ -142,6 +169,15 @@ export class VideoOnDemand extends cdk.Stack {
           },
           EnableSqs: {
             default: 'Enable SQS Messaging'
+          },
+          EnableSubtitleProcessing: {
+            default: 'Enable Subtitle Processing'
+          },
+          SubtitlePrimaryLanguage: {
+            default: 'Primary Language'
+          },
+          SubtitleTargetLanguages: {
+            default: 'Target Languages'
           }
         }
       }
@@ -170,6 +206,9 @@ export class VideoOnDemand extends cdk.Stack {
     });
     const conditionEnableSqs = new cdk.CfnCondition(this, 'EnableSqsCondition', {
       expression: cdk.Fn.conditionEquals(enableSqs.valueAsString, 'Yes')
+    });
+    const conditionEnableSubtitleProcessing = new cdk.CfnCondition(this, 'EnableSubtitleProcessingCondition', {
+      expression: cdk.Fn.conditionEquals(enableSubtitleProcessing.valueAsString, 'Yes')
     });
 
 
@@ -977,7 +1016,11 @@ export class VideoOnDemand extends cdk.Stack {
         InputRotate: 'DEGREE_0',
         EnableSns: `${cdk.Fn.conditionIf(conditionEnableSns.logicalId, 'true', 'false')}`,
         EnableSqs: `${cdk.Fn.conditionIf(conditionEnableSqs.logicalId, 'true', 'false')}`,
-        AcceleratedTranscoding: acceleratedTranscoding.valueAsString
+        AcceleratedTranscoding: acceleratedTranscoding.valueAsString,
+        // Subtitle processing configuration
+        SUBTITLE_ENABLED: cdk.Fn.conditionIf(conditionEnableSubtitleProcessing.logicalId, 'true', 'false').toString(),
+        SUBTITLE_PRIMARY_LANGUAGE: subtitlePrimaryLanguage.valueAsString,
+        SUBTITLE_TARGET_LANGUAGES: cdk.Fn.join(',', subtitleTargetLanguages.valueAsList)
       },
       role: inputValidateRole,
       code: lambda.Code.fromAsset('../input-validate'),
@@ -1863,7 +1906,8 @@ export class VideoOnDemand extends cdk.Stack {
           resources: [
             `arn:${cdk.Aws.PARTITION}:states:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:stateMachine:${cdk.Aws.STACK_NAME}-ingest`,
             `arn:${cdk.Aws.PARTITION}:states:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:stateMachine:${cdk.Aws.STACK_NAME}-process`,
-            `arn:${cdk.Aws.PARTITION}:states:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:stateMachine:${cdk.Aws.STACK_NAME}-publish`
+            `arn:${cdk.Aws.PARTITION}:states:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:stateMachine:${cdk.Aws.STACK_NAME}-publish`,
+            `arn:${cdk.Aws.PARTITION}:states:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:stateMachine:${cdk.Aws.STACK_NAME}-subtitle-processor`
           ],
           actions: ['states:StartExecution']
         }),
@@ -1917,6 +1961,7 @@ export class VideoOnDemand extends cdk.Stack {
         IngestWorkflow: `arn:${cdk.Aws.PARTITION}:states:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:stateMachine:${cdk.Aws.STACK_NAME}-ingest`,
         ProcessWorkflow: `arn:${cdk.Aws.PARTITION}:states:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:stateMachine:${cdk.Aws.STACK_NAME}-process`,
         PublishWorkflow: `arn:${cdk.Aws.PARTITION}:states:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:stateMachine:${cdk.Aws.STACK_NAME}-publish`,
+        SubtitleProcessorWorkflow: `arn:${cdk.Aws.PARTITION}:states:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:stateMachine:${cdk.Aws.STACK_NAME}-subtitle-processor`,
         ErrorHandler: errorHandlerLambda.functionArn
       },
       role: stepFunctionsRole,
@@ -2116,6 +2161,19 @@ export class VideoOnDemand extends cdk.Stack {
       lambdaFunction: sqsSendMessageLambda,
       payloadResponseOnly: true
     });
+    const subtitleProcessorTriggerTask = new tasks.LambdaInvoke(this, 'Subtitle Processor Trigger', {
+      lambdaFunction: stepFunctionsLambda,
+      payload: sfn.TaskInput.fromObject({
+        'guid.$': '$.guid',
+        'srcVideo.$': '$.srcVideo',
+        'srcBucket.$': '$.srcBucket',
+        'destBucket.$': '$.destBucket',
+        'subtitleConfig.$': '$.subtitleConfig',
+        'subtitleTrigger': true
+      }),
+      resultPath: '$.subtitleProcessorResult', // Store Lambda result in a separate field
+      payloadResponseOnly: false // Keep the original input data
+    });
     const completeState = new sfn.Pass(this, 'Complete');
 
     /**
@@ -2190,6 +2248,7 @@ export class VideoOnDemand extends cdk.Stack {
         .when(sfn.Condition.booleanEquals('$.frameCapture', false), new sfn.Pass(this, 'No Frame Capture'))
         .afterwards())
       .next(encodeTask)
+      .next(subtitleProcessorTriggerTask)
       .next(dynamodbUpdateTaskProcess);
 
     const processWorkflow = new sfn.StateMachine(this, 'ProcessWorkflow', {
@@ -2301,6 +2360,499 @@ export class VideoOnDemand extends cdk.Stack {
       ]
     );
 
+    /**
+     * Subtitle Config role and lambda
+     */
+    const subtitleConfigRole = new iam.Role(this, 'SubtitleConfigRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com')
+    });
+    const subtitleConfigPolicy = new iam.Policy(this, 'SubtitleConfigPolicy', {
+      policyName: `${cdk.Aws.STACK_NAME}-subtitle-config-role`,
+      statements: [
+        new iam.PolicyStatement({
+          resources: [`${source.bucketArn}/*`],
+          actions: ['s3:GetObject']
+        }),
+        new iam.PolicyStatement({
+          resources: [dynamoDBTable.tableArn],
+          actions: ['dynamodb:GetItem', 'dynamodb:UpdateItem']
+        }),
+        new iam.PolicyStatement({
+          resources: [snsTopic.topicArn],
+          actions: ['sns:Publish']
+        }),
+        new iam.PolicyStatement({
+          resources: [errorHandlerLambda.functionArn],
+          actions: ['lambda:InvokeFunction']
+        }),
+        new iam.PolicyStatement({
+          resources: [`arn:${cdk.Aws.PARTITION}:logs:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:log-group:/aws/lambda/*`],
+          actions: [
+            'logs:CreateLogGroup',
+            'logs:CreateLogStream',
+            'logs:PutLogEvents'
+          ]
+        })
+      ]
+    });
+    subtitleConfigPolicy.attachToRole(subtitleConfigRole);
+
+    //cfn_nag
+    const cfnSubtitleConfigRole = subtitleConfigRole.node.findChild('Resource') as iam.CfnRole;
+    cfnSubtitleConfigRole.cfnOptions.metadata = {
+      cfn_nag: {
+        rules_to_suppress: [
+          {
+            id: 'W11',
+            reason: '* is used so that the Lambda function can create log groups'
+          }
+        ]
+      }
+    };
+    //cdk_nag
+    NagSuppressions.addResourceSuppressions(
+      subtitleConfigPolicy,
+      [
+        {
+          id: 'AwsSolutions-IAM5',
+          reason: '* is used so that the Lambda function can create log groups'
+        }
+      ]
+    );
+
+    const subtitleConfigLambda = new lambda.Function(this, 'SubtitleConfigLambda', {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: 'index.handler',
+      functionName: `${cdk.Aws.STACK_NAME}-subtitle-config`,
+      description: 'Loads and validates subtitle processing configuration',
+      environment: {
+        SOLUTION_IDENTIFIER: `AwsSolution/${solutionId}/%%VERSION%%`,
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
+        ErrorHandler: errorHandlerLambda.functionArn,
+        DynamoDBTable: dynamoDBTable.tableName,
+        Source: source.bucketName,
+        SnsTopic: snsTopic.topicArn,
+        SUBTITLE_PROCESSING_ENABLED: cdk.Fn.conditionIf(conditionEnableSubtitleProcessing.logicalId, 'true', 'false').toString(),
+        SUBTITLE_PRIMARY_LANGUAGE: subtitlePrimaryLanguage.valueAsString,
+        SUBTITLE_TARGET_LANGUAGES: cdk.Fn.join(',', subtitleTargetLanguages.valueAsList)
+      },
+      role: subtitleConfigRole,
+      code: lambda.Code.fromAsset('../subtitle-config'),
+      timeout: cdk.Duration.seconds(120)
+    });
+    subtitleConfigLambda.node.addDependency(subtitleConfigRole);
+    subtitleConfigLambda.node.addDependency(subtitleConfigPolicy);
+
+    /**
+     * Transcription role and lambda
+     */
+    const transcriptionRole = new iam.Role(this, 'TranscriptionRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com')
+    });
+    const transcriptionPolicy = new iam.Policy(this, 'TranscriptionPolicy', {
+      policyName: `${cdk.Aws.STACK_NAME}-transcription-role`,
+      statements: [
+        new iam.PolicyStatement({
+          resources: [`${source.bucketArn}/*`, `${destination.bucketArn}/*`],
+          actions: ['s3:GetObject', 's3:PutObject']
+        }),
+        new iam.PolicyStatement({
+          resources: ['*'],
+          actions: [
+            'transcribe:StartTranscriptionJob',
+            'transcribe:GetTranscriptionJob',
+            'transcribe:ListTranscriptionJobs'
+          ]
+        }),
+        new iam.PolicyStatement({
+          resources: [dynamoDBTable.tableArn],
+          actions: ['dynamodb:UpdateItem']
+        }),
+        new iam.PolicyStatement({
+          resources: [errorHandlerLambda.functionArn],
+          actions: ['lambda:InvokeFunction']
+        }),
+        new iam.PolicyStatement({
+          resources: [`arn:${cdk.Aws.PARTITION}:logs:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:log-group:/aws/lambda/*`],
+          actions: [
+            'logs:CreateLogGroup',
+            'logs:CreateLogStream',
+            'logs:PutLogEvents'
+          ]
+        })
+      ]
+    });
+    transcriptionPolicy.attachToRole(transcriptionRole);
+
+    //cfn_nag
+    const cfnTranscriptionRole = transcriptionRole.node.findChild('Resource') as iam.CfnRole;
+    cfnTranscriptionRole.cfnOptions.metadata = {
+      cfn_nag: {
+        rules_to_suppress: [
+          {
+            id: 'W11',
+            reason: '* is used for AWS Transcribe service actions and CloudWatch logs'
+          }
+        ]
+      }
+    };
+    //cdk_nag
+    NagSuppressions.addResourceSuppressions(
+      transcriptionPolicy,
+      [
+        {
+          id: 'AwsSolutions-IAM5',
+          reason: '* is used for AWS Transcribe service actions and CloudWatch logs'
+        }
+      ]
+    );
+
+    const transcriptionLambda = new lambda.Function(this, 'TranscriptionLambda', {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: 'index.handler',
+      functionName: `${cdk.Aws.STACK_NAME}-transcription`,
+      description: 'Initiates and monitors AWS Transcribe jobs for video files',
+      environment: {
+        SOLUTION_IDENTIFIER: `AwsSolution/${solutionId}/%%VERSION%%`,
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
+        ErrorHandler: errorHandlerLambda.functionArn,
+        DynamoDBTable: dynamoDBTable.tableName,
+        Source: source.bucketName,
+        Destination: destination.bucketName
+      },
+      role: transcriptionRole,
+      code: lambda.Code.fromAsset('../transcription'),
+      timeout: cdk.Duration.seconds(900), // 15 minutes for long transcription jobs
+      memorySize: 1024 // Increased memory for polling operations
+    });
+    transcriptionLambda.node.addDependency(transcriptionRole);
+    transcriptionLambda.node.addDependency(transcriptionPolicy);
+
+    /**
+     * Translation Coordinator role and lambda
+     */
+    const translationCoordinatorRole = new iam.Role(this, 'TranslationCoordinatorRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com')
+    });
+    const translationCoordinatorPolicy = new iam.Policy(this, 'TranslationCoordinatorPolicyV2', {
+      policyName: `${cdk.Aws.STACK_NAME}-translation-coordinator-policy-v2`, // Force complete recreation
+      statements: [
+        new iam.PolicyStatement({
+          resources: [destination.bucketArn],
+          actions: ['s3:ListBucket']
+        }),
+        new iam.PolicyStatement({
+          resources: [`${destination.bucketArn}/*`],
+          actions: [
+            's3:GetObject',
+            's3:PutObject' // Required for storing transcription segments
+          ]
+        }),
+        new iam.PolicyStatement({
+          resources: [dynamoDBTable.tableArn],
+          actions: ['dynamodb:UpdateItem']
+        }),
+        new iam.PolicyStatement({
+          resources: [errorHandlerLambda.functionArn],
+          actions: ['lambda:InvokeFunction']
+        }),
+        new iam.PolicyStatement({
+          resources: [`arn:${cdk.Aws.PARTITION}:logs:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:log-group:/aws/lambda/*`],
+          actions: [
+            'logs:CreateLogGroup',
+            'logs:CreateLogStream',
+            'logs:PutLogEvents'
+          ]
+        })
+      ]
+    });
+    translationCoordinatorPolicy.attachToRole(translationCoordinatorRole);
+
+    //cfn_nag
+    const cfnTranslationCoordinatorRole = translationCoordinatorRole.node.findChild('Resource') as iam.CfnRole;
+    cfnTranslationCoordinatorRole.cfnOptions.metadata = {
+      cfn_nag: {
+        rules_to_suppress: [
+          {
+            id: 'W11',
+            reason: '* is used so that the Lambda function can create log groups'
+          }
+        ]
+      }
+    };
+    //cdk_nag
+    NagSuppressions.addResourceSuppressions(
+      translationCoordinatorPolicy,
+      [
+        {
+          id: 'AwsSolutions-IAM5',
+          reason: '* is used so that the Lambda function can create log groups'
+        }
+      ]
+    );
+
+    const translationCoordinatorLambda = new lambda.Function(this, 'TranslationCoordinatorLambda', {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: 'index.handler',
+      functionName: `${cdk.Aws.STACK_NAME}-translation-coordinator`,
+      description: 'Orchestrates parallel translation tasks for multiple target languages',
+      environment: {
+        SOLUTION_IDENTIFIER: `AwsSolution/${solutionId}/%%VERSION%%`,
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
+        ErrorHandler: errorHandlerLambda.functionArn,
+        DynamoDBTable: dynamoDBTable.tableName,
+        Destination: destination.bucketName
+      },
+      role: translationCoordinatorRole,
+      code: lambda.Code.fromAsset('../translation-coordinator'),
+      timeout: cdk.Duration.seconds(300), // 5 minutes for processing large transcripts
+      memorySize: 512 // Lightweight coordination
+    });
+    translationCoordinatorLambda.node.addDependency(translationCoordinatorRole);
+    translationCoordinatorLambda.node.addDependency(translationCoordinatorPolicy);
+
+    /**
+     * Translation Worker role and lambda
+     */
+    const translationWorkerRole = new iam.Role(this, 'TranslationWorkerRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com')
+    });
+    const translationWorkerPolicy = new iam.Policy(this, 'TranslationWorkerPolicyV2', {
+      policyName: `${cdk.Aws.STACK_NAME}-translation-worker-policy-v2`, // Force complete recreation
+      statements: [
+        new iam.PolicyStatement({
+          resources: ['*'],
+          actions: [
+            'translate:TranslateText',
+            'translate:DescribeTextTranslationJob'
+          ]
+        }),
+        new iam.PolicyStatement({
+          resources: [destination.bucketArn],
+          actions: ['s3:ListBucket']
+        }),
+        new iam.PolicyStatement({
+          resources: [`${destination.bucketArn}/*`],
+          actions: [
+            's3:GetObject', // For retrieving transcription segments
+            's3:PutObject'  // For storing translated segments
+          ]
+        }),
+        new iam.PolicyStatement({
+          resources: [dynamoDBTable.tableArn],
+          actions: ['dynamodb:UpdateItem']
+        }),
+        new iam.PolicyStatement({
+          resources: [errorHandlerLambda.functionArn],
+          actions: ['lambda:InvokeFunction']
+        }),
+        new iam.PolicyStatement({
+          resources: [`arn:${cdk.Aws.PARTITION}:logs:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:log-group:/aws/lambda/*`],
+          actions: [
+            'logs:CreateLogGroup',
+            'logs:CreateLogStream',
+            'logs:PutLogEvents'
+          ]
+        })
+      ]
+    });
+    translationWorkerPolicy.attachToRole(translationWorkerRole);
+
+    //cfn_nag
+    const cfnTranslationWorkerRole = translationWorkerRole.node.findChild('Resource') as iam.CfnRole;
+    cfnTranslationWorkerRole.cfnOptions.metadata = {
+      cfn_nag: {
+        rules_to_suppress: [
+          {
+            id: 'W11',
+            reason: '* is used for AWS Translate service actions and CloudWatch logs'
+          }
+        ]
+      }
+    };
+    //cdk_nag
+    NagSuppressions.addResourceSuppressions(
+      translationWorkerPolicy,
+      [
+        {
+          id: 'AwsSolutions-IAM5',
+          reason: '* is used for AWS Translate service actions and CloudWatch logs'
+        }
+      ]
+    );
+
+    const translationWorkerLambda = new lambda.Function(this, 'TranslationWorkerLambda', {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: 'index.handler',
+      functionName: `${cdk.Aws.STACK_NAME}-translation-worker`,
+      description: 'Translates text segments for a specific target language',
+      environment: {
+        SOLUTION_IDENTIFIER: `AwsSolution/${solutionId}/%%VERSION%%`,
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
+        ErrorHandler: errorHandlerLambda.functionArn,
+        DynamoDBTable: dynamoDBTable.tableName
+      },
+      role: translationWorkerRole,
+      code: lambda.Code.fromAsset('../translation-worker'),
+      timeout: cdk.Duration.seconds(600), // 10 minutes for translating many segments
+      memorySize: 1024 // Processing translation batches
+    });
+    translationWorkerLambda.node.addDependency(translationWorkerRole);
+    translationWorkerLambda.node.addDependency(translationWorkerPolicy);
+
+    /**
+     * WebVTT Generator role and lambda
+     */
+    const webvttGeneratorRole = new iam.Role(this, 'WebVTTGeneratorRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com')
+    });
+    const webvttGeneratorPolicy = new iam.Policy(this, 'WebVTTGeneratorPolicyV2', {
+      policyName: `${cdk.Aws.STACK_NAME}-webvtt-generator-policy-v2`, // Force complete recreation
+      statements: [
+        new iam.PolicyStatement({
+          resources: [destination.bucketArn],
+          actions: ['s3:ListBucket']
+        }),
+        new iam.PolicyStatement({
+          resources: [`${destination.bucketArn}/*`],
+          actions: [
+            's3:GetObject',    // For retrieving translated segments
+            's3:PutObject', 
+            's3:PutObjectAcl'
+          ]
+        }),
+        new iam.PolicyStatement({
+          resources: [dynamoDBTable.tableArn],
+          actions: ['dynamodb:UpdateItem']
+        }),
+        new iam.PolicyStatement({
+          resources: [errorHandlerLambda.functionArn],
+          actions: ['lambda:InvokeFunction']
+        }),
+        new iam.PolicyStatement({
+          resources: [`arn:${cdk.Aws.PARTITION}:logs:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:log-group:/aws/lambda/*`],
+          actions: [
+            'logs:CreateLogGroup',
+            'logs:CreateLogStream',
+            'logs:PutLogEvents'
+          ]
+        })
+      ]
+    });
+    webvttGeneratorPolicy.attachToRole(webvttGeneratorRole);
+
+    //cfn_nag
+    const cfnWebVTTGeneratorRole = webvttGeneratorRole.node.findChild('Resource') as iam.CfnRole;
+    cfnWebVTTGeneratorRole.cfnOptions.metadata = {
+      cfn_nag: {
+        rules_to_suppress: [
+          {
+            id: 'W11',
+            reason: '* is used so that the Lambda function can create log groups'
+          }
+        ]
+      }
+    };
+    //cdk_nag
+    NagSuppressions.addResourceSuppressions(
+      webvttGeneratorPolicy,
+      [
+        {
+          id: 'AwsSolutions-IAM5',
+          reason: '* is used so that the Lambda function can create log groups'
+        }
+      ]
+    );
+
+    const webvttGeneratorLambda = new lambda.Function(this, 'WebVTTGeneratorLambda', {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: 'index.handler',
+      functionName: `${cdk.Aws.STACK_NAME}-webvtt-generator`,
+      description: 'Generates properly formatted WebVTT files from translated content',
+      environment: {
+        SOLUTION_IDENTIFIER: `AwsSolution/${solutionId}/%%VERSION%%`,
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
+        ErrorHandler: errorHandlerLambda.functionArn,
+        DynamoDBTable: dynamoDBTable.tableName,
+        Destination: destination.bucketName,
+        CloudFront: distribution.cloudFrontWebDistribution.domainName
+      },
+      role: webvttGeneratorRole,
+      code: lambda.Code.fromAsset('../webvtt-generator'),
+      timeout: cdk.Duration.seconds(600), // 10 minutes for generating large WebVTT files
+      memorySize: 1024 // Generating and validating WebVTT
+    });
+    webvttGeneratorLambda.node.addDependency(webvttGeneratorRole);
+    webvttGeneratorLambda.node.addDependency(webvttGeneratorPolicy);
+
+    /**
+     * CloudWatch Log Groups for new Lambda functions
+     */
+    const subtitleConfigLogGroup = new logs.LogGroup(this, 'SubtitleConfigLogGroup', {
+      logGroupName: `/aws/lambda/${cdk.Aws.STACK_NAME}-subtitle-config`,
+      retention: logs.RetentionDays.ONE_WEEK
+    });
+
+    const transcriptionLogGroup = new logs.LogGroup(this, 'TranscriptionLogGroup', {
+      logGroupName: `/aws/lambda/${cdk.Aws.STACK_NAME}-transcription`,
+      retention: logs.RetentionDays.ONE_WEEK
+    });
+
+    const translationCoordinatorLogGroup = new logs.LogGroup(this, 'TranslationCoordinatorLogGroup', {
+      logGroupName: `/aws/lambda/${cdk.Aws.STACK_NAME}-translation-coordinator`,
+      retention: logs.RetentionDays.ONE_WEEK
+    });
+
+    const translationWorkerLogGroup = new logs.LogGroup(this, 'TranslationWorkerLogGroup', {
+      logGroupName: `/aws/lambda/${cdk.Aws.STACK_NAME}-translation-worker`,
+      retention: logs.RetentionDays.ONE_WEEK
+    });
+
+    const webvttGeneratorLogGroup = new logs.LogGroup(this, 'WebVTTGeneratorLogGroup', {
+      logGroupName: `/aws/lambda/${cdk.Aws.STACK_NAME}-webvtt-generator`,
+      retention: logs.RetentionDays.ONE_WEEK
+    });
+
+    /**
+     * Subtitle Processor State Machine
+     * Handles transcription and translation of video content to generate WebVTT subtitle files
+     * Integrates with existing workflow without disrupting main video processing
+     */
+    const subtitleProcessorDefinition = JSON.parse(
+      require('fs').readFileSync(require('path').join(__dirname, 'subtitle-processor-state-machine.json'), 'utf8')
+    );
+
+    // Replace placeholders with actual Lambda function ARNs
+    const subtitleProcessorDefinitionString = JSON.stringify(subtitleProcessorDefinition)
+      .replace(/\$\{SubtitleConfigLambdaArn\}/g, subtitleConfigLambda.functionArn)
+      .replace(/\$\{TranscriptionLambdaArn\}/g, transcriptionLambda.functionArn)
+      .replace(/\$\{TranslationCoordinatorLambdaArn\}/g, translationCoordinatorLambda.functionArn)
+      .replace(/\$\{TranslationWorkerLambdaArn\}/g, translationWorkerLambda.functionArn)
+      .replace(/\$\{WebVTTGeneratorLambdaArn\}/g, webvttGeneratorLambda.functionArn)
+      .replace(/\$\{DynamoUpdateLambdaArn\}/g, dynamoUpdateLambda.functionArn)
+      .replace(/\$\{ErrorHandlerLambdaArn\}/g, errorHandlerLambda.functionArn)
+      .replace(/\$\{StepFunctionsLambdaArn\}/g, stepFunctionsLambda.functionArn);
+
+    const subtitleProcessorWorkflow = new sfn.StateMachine(this, 'SubtitleProcessorWorkflow', {
+      stateMachineName: `${cdk.Aws.STACK_NAME}-subtitle-processor`,
+      role: stepFunctionsServiceRole,
+      definitionBody: sfn.DefinitionBody.fromString(subtitleProcessorDefinitionString)
+    });
+
+    //cdk_nag
+    NagSuppressions.addResourceSuppressions(
+      subtitleProcessorWorkflow,
+      [
+        {
+          id: 'AwsSolutions-SF1',
+          reason: 'Logging handled by DynamoDB Update step and Error Handler lambda'
+        }, {
+          id: 'AwsSolutions-SF2',
+          reason: 'Optional configuration for this solution'
+        }
+      ]
+    );
+
 
     /**
      * Custom Resource: UUID
@@ -2374,6 +2926,21 @@ export class VideoOnDemand extends cdk.Stack {
       value: sqsQueue.queueArn,
       description: 'SQS Queue ARN',
       exportName: `${cdk.Aws.STACK_NAME}:SqsQueueArn`
+    });
+    new cdk.CfnOutput(this, 'SubtitleProcessingEnabledOutput', { // NOSONAR
+      value: enableSubtitleProcessing.valueAsString,
+      description: 'Subtitle Processing Enabled',
+      exportName: `${cdk.Aws.STACK_NAME}:SubtitleProcessingEnabled`
+    });
+    new cdk.CfnOutput(this, 'SubtitlePrimaryLanguageOutput', { // NOSONAR
+      value: subtitlePrimaryLanguage.valueAsString,
+      description: 'Subtitle Primary Language',
+      exportName: `${cdk.Aws.STACK_NAME}:SubtitlePrimaryLanguage`
+    });
+    new cdk.CfnOutput(this, 'SubtitleTargetLanguagesOutput', { // NOSONAR
+      value: cdk.Fn.join(',', subtitleTargetLanguages.valueAsList),
+      description: 'Subtitle Target Languages',
+      exportName: `${cdk.Aws.STACK_NAME}:SubtitleTargetLanguages`
     });
 
     /**

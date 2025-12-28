@@ -23,6 +23,7 @@ describe('#STEP FUNCTIONS::', () => {
     process.env.IngestWorkflow = 'INGEST';
     process.env.ProcessWorkflow = 'PROCESS';
     process.env.PublishWorkflow = 'PUBLISH';
+    process.env.SubtitleProcessorWorkflow = 'SUBTITLE_PROCESSOR';
     process.env.ErrorHandler = 'error_handler';
 
     const _ingest = {
@@ -37,6 +38,19 @@ describe('#STEP FUNCTIONS::', () => {
 
     const _process = {
         guid: '1234'
+    };
+
+    const _subtitleTrigger = {
+        guid: '1234',
+        srcVideo: 'test-video.mp4',
+        srcBucket: 'source-bucket',
+        destBucket: 'dest-bucket',
+        subtitleConfig: {
+            enabled: true,
+            primaryLanguage: 'auto',
+            targetLanguages: ['en', 'es', 'fr']
+        },
+        subtitleTrigger: true
     };
 
     const _publish = {
@@ -69,6 +83,13 @@ describe('#STEP FUNCTIONS::', () => {
         sFNClientMock.on(StartExecutionCommand).resolves(data);
 
         const response = await lambda.handler(_process);
+        expect(response).to.equal('success');
+    });
+
+    it('should return "success" on subtitle processor trigger success', async () => {
+        sFNClientMock.on(StartExecutionCommand).resolves(data);
+
+        const response = await lambda.handler(_subtitleTrigger);
         expect(response).to.equal('success');
     });
 

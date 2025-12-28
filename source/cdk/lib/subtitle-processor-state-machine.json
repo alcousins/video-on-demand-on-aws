@@ -1,0 +1,523 @@
+{
+  "Comment": "Subtitle Processor State Machine - Handles transcription and translation of video content",
+  "StartAt": "LoadSubtitleConfiguration",
+  "States": {
+    "LoadSubtitleConfiguration": {
+      "Type": "Task",
+      "Comment": "Load and validate subtitle processing configuration from environment and metadata overrides",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${SubtitleConfigLambdaArn}",
+        "Payload.$": "$"
+      },
+      "ResultPath": "$.configurationResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleConfigurationError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CheckSubtitleConfig"
+    },
+    "CheckSubtitleConfig": {
+      "Type": "Choice",
+      "Comment": "Check if subtitle processing is enabled",
+      "Choices": [
+        {
+          "Variable": "$.configurationResult.Payload.subtitleConfig.enabled",
+          "BooleanEquals": true,
+          "Next": "StartTranscription"
+        }
+      ],
+      "Default": "SubtitleProcessingDisabled"
+    },
+    "SubtitleProcessingDisabled": {
+      "Type": "Pass",
+      "Comment": "Subtitle processing is disabled, skip to completion",
+      "Result": {
+        "subtitleProcessing": {
+          "status": "disabled",
+          "message": "Subtitle processing is disabled in configuration"
+        }
+      },
+      "ResultPath": "$.subtitleResult",
+      "Next": "TriggerPublishWorkflow"
+    },
+    "StartTranscription": {
+      "Type": "Task",
+      "Comment": "Start transcription job using AWS Transcribe with performance optimizations for long videos",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${TranscriptionLambdaArn}",
+        "Payload.$": "$.configurationResult.Payload"
+      },
+      "TimeoutSeconds": 1800,
+      "ResultPath": "$.transcriptionResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleTranscriptionError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CheckTranscriptionSuccess"
+    },
+    "CheckTranscriptionSuccess": {
+      "Type": "Choice",
+      "Comment": "Check if transcription completed successfully",
+      "Choices": [
+        {
+          "Variable": "$.transcriptionResult.Payload.transcriptionJobName",
+          "IsPresent": true,
+          "Next": "StartTranslationCoordinator"
+        }
+      ],
+      "Default": "HandleTranscriptionError"
+    },
+    "StartTranslationCoordinator": {
+      "Type": "Task",
+      "Comment": "Coordinate parallel translation tasks for multiple languages with performance optimization",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${TranslationCoordinatorLambdaArn}",
+        "Payload.$": "$.transcriptionResult.Payload"
+      },
+      "TimeoutSeconds": 600,
+      "ResultPath": "$.translationTasks",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleTranslationError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CheckTranslationTasks"
+    },
+    "CheckTranslationTasks": {
+      "Type": "Choice",
+      "Comment": "Check if translation tasks were generated successfully",
+      "Choices": [
+        {
+          "Variable": "$.translationTasks.Payload.translationTasks",
+          "IsPresent": true,
+          "Next": "ExecuteTranslations"
+        }
+      ],
+      "Default": "HandleTranslationError"
+    },
+    "ExecuteTranslations": {
+      "Type": "Map",
+      "Comment": "Execute translation tasks in parallel using Map state with performance optimization for large workloads",
+      "ItemsPath": "$.translationTasks.Payload.parallelTranslationInput",
+      "MaxConcurrency": 5,
+      "ToleratedFailurePercentage": 25,
+      "Iterator": {
+        "StartAt": "TranslateLanguage",
+        "States": {
+          "TranslateLanguage": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${TranslationWorkerLambdaArn}",
+              "Payload.$": "$"
+            },
+            "TimeoutSeconds": 900,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 2,
+                "BackoffRate": 1.5
+              },
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 1,
+                "BackoffRate": 1.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "Next": "TranslationFailed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "End": true
+          },
+          "TranslationFailed": {
+            "Type": "Pass",
+            "Result": {
+              "status": "failed",
+              "error": "Translation failed for this language"
+            },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.translationResults",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleTranslationError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "GenerateWebVTTFiles"
+    },
+    "GenerateWebVTTFiles": {
+      "Type": "Task",
+      "Comment": "Generate WebVTT subtitle files from translated content with memory optimization for large files",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${WebVTTGeneratorLambdaArn}",
+        "Payload": {
+          "guid.$": "$.guid",
+          "srcVideo.$": "$.srcVideo",
+          "srcBucket.$": "$.srcBucket",
+          "destBucket.$": "$.destBucket",
+          "subtitleConfig.$": "$.configurationResult.Payload.subtitleConfig",
+          "transcriptionResult.$": "$.transcriptionResult.Payload",
+          "translationReferences.$": "$.translationResults"
+        }
+      },
+      "TimeoutSeconds": 900,
+      "ResultPath": "$.webvttResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleWebVTTError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "UpdateDynamoDBWithResults"
+    },
+    "UpdateDynamoDBWithResults": {
+      "Type": "Task",
+      "Comment": "Update DynamoDB with subtitle processing results and file locations",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DynamoUpdateLambdaArn}",
+        "Payload": {
+          "guid.$": "$.guid",
+          "workflowStatus": "Complete",
+          "subtitleProcessing": {
+            "status": "completed",
+            "subtitleFiles.$": "$.webvttResult.Payload.webvttFiles",
+            "processingEndTime.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": "$.dynamoResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleDynamoError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "SubtitleProcessingComplete"
+    },
+    "SubtitleProcessingComplete": {
+      "Type": "Pass",
+      "Comment": "Subtitle processing completed successfully",
+      "Result": {
+        "subtitleProcessing": {
+          "status": "completed",
+          "message": "Subtitle processing completed successfully"
+        }
+      },
+      "ResultPath": "$.subtitleResult",
+      "Next": "TriggerPublishWorkflow"
+    },
+    "TriggerPublishWorkflow": {
+      "Type": "Task",
+      "Comment": "Trigger the existing Publish Workflow to continue the main video processing pipeline",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${StepFunctionsLambdaArn}",
+        "Payload": {
+          "detail": {
+            "status": "COMPLETE",
+            "userMetadata": {
+              "guid.$": "$.guid",
+              "workflow.$": "$$.StateMachine.Name"
+            }
+          }
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandlePublishTriggerError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "End": true
+    },
+    "HandleConfigurationError": {
+      "Type": "Task",
+      "Comment": "Handle configuration errors and determine if workflow should continue",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ErrorHandlerLambdaArn}",
+        "Payload": {
+          "guid.$": "$.guid",
+          "function": "subtitle-configuration",
+          "error": "Subtitle configuration failed",
+          "details.$": "$.error"
+        }
+      },
+      "ResultPath": "$.errorResult",
+      "Next": "TriggerPublishWorkflowAfterError"
+    },
+    "HandleTranscriptionError": {
+      "Type": "Task",
+      "Comment": "Handle transcription errors and update status",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DynamoUpdateLambdaArn}",
+        "Payload": {
+          "guid.$": "$.guid",
+          "workflowStatus": "Error",
+          "subtitleProcessing": {
+            "status": "failed",
+            "errorDetails": "Transcription failed",
+            "processingEndTime.$": "$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": "$.errorResult",
+      "Next": "NotifyTranscriptionError"
+    },
+    "HandleTranslationError": {
+      "Type": "Task",
+      "Comment": "Handle translation errors and update status",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DynamoUpdateLambdaArn}",
+        "Payload": {
+          "guid.$": "$.guid",
+          "workflowStatus": "Error",
+          "subtitleProcessing": {
+            "status": "failed",
+            "errorDetails": "Translation failed",
+            "processingEndTime.$": "$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": "$.errorResult",
+      "Next": "NotifyTranslationError"
+    },
+    "HandleWebVTTError": {
+      "Type": "Task",
+      "Comment": "Handle WebVTT generation errors and update status",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DynamoUpdateLambdaArn}",
+        "Payload": {
+          "guid.$": "$.guid",
+          "workflowStatus": "Error",
+          "subtitleProcessing": {
+            "status": "failed",
+            "errorDetails": "WebVTT generation failed",
+            "processingEndTime.$": "$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": "$.errorResult",
+      "Next": "NotifyWebVTTError"
+    },
+    "HandleDynamoError": {
+      "Type": "Task",
+      "Comment": "Handle DynamoDB update errors",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ErrorHandlerLambdaArn}",
+        "Payload": {
+          "guid.$": "$.guid",
+          "error": "Failed to update DynamoDB with subtitle processing results",
+          "details.$": "$.error"
+        }
+      },
+      "ResultPath": "$.errorResult",
+      "Next": "TriggerPublishWorkflowAfterError"
+    },
+    "HandlePublishTriggerError": {
+      "Type": "Task",
+      "Comment": "Handle errors when triggering publish workflow",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ErrorHandlerLambdaArn}",
+        "Payload": {
+          "guid.$": "$.guid",
+          "error": "Failed to trigger publish workflow after subtitle processing",
+          "details.$": "$.error"
+        }
+      },
+      "End": true
+    },
+    "NotifyTranscriptionError": {
+      "Type": "Task",
+      "Comment": "Send error notification for transcription failure",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ErrorHandlerLambdaArn}",
+        "Payload": {
+          "guid.$": "$.guid",
+          "error": "Subtitle transcription failed",
+          "details.$": "$.error"
+        }
+      },
+      "ResultPath": "$.notificationResult",
+      "Next": "TriggerPublishWorkflowAfterError"
+    },
+    "NotifyTranslationError": {
+      "Type": "Task",
+      "Comment": "Send error notification for translation failure",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ErrorHandlerLambdaArn}",
+        "Payload": {
+          "guid.$": "$.guid",
+          "error": "Subtitle translation failed",
+          "details.$": "$.error"
+        }
+      },
+      "ResultPath": "$.notificationResult",
+      "Next": "TriggerPublishWorkflowAfterError"
+    },
+    "NotifyWebVTTError": {
+      "Type": "Task",
+      "Comment": "Send error notification for WebVTT generation failure",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ErrorHandlerLambdaArn}",
+        "Payload": {
+          "guid.$": "$.guid",
+          "error": "WebVTT subtitle generation failed",
+          "details.$": "$.error"
+        }
+      },
+      "ResultPath": "$.notificationResult",
+      "Next": "TriggerPublishWorkflowAfterError"
+    },
+    "TriggerPublishWorkflowAfterError": {
+      "Type": "Task",
+      "Comment": "Continue main workflow even after subtitle processing errors",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${StepFunctionsLambdaArn}",
+        "Payload": {
+          "detail": {
+            "status": "COMPLETE",
+            "userMetadata": {
+              "guid.$": "$.guid",
+              "workflow.$": "$$.StateMachine.Name"
+            }
+          }
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    }
+  }
+}

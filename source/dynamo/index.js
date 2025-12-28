@@ -30,12 +30,40 @@ exports.handler = async (event) => {
         delete event.guid;
         let expression = '';
         let values = {};
+        let names = {};
         let i = 0;
 
+        // Helper function to check if a key contains nested attributes
+        const hasNestedAttribute = (key) => key.includes('.');
+
+        // Separate nested and non-nested attributes
+        const nestedAttributes = {};
+        const flatAttributes = {};
+
         Object.keys(event).forEach((key) => {
+            if (hasNestedAttribute(key)) {
+                const [parentKey, childKey] = key.split('.');
+                if (!nestedAttributes[parentKey]) {
+                    nestedAttributes[parentKey] = {};
+                }
+                nestedAttributes[parentKey][childKey] = event[key];
+            } else {
+                flatAttributes[key] = event[key];
+            }
+        });
+
+        // Build update expression for flat attributes
+        Object.keys(flatAttributes).forEach((key) => {
             i++;
             expression += ' ' + key + ' = :' + i + ',';
-            values[':' + i] = event[key];
+            values[':' + i] = flatAttributes[key];
+        });
+
+        // Build update expression for nested attributes
+        Object.keys(nestedAttributes).forEach((parentKey) => {
+            i++;
+            expression += ' ' + parentKey + ' = :' + i + ',';
+            values[':' + i] = nestedAttributes[parentKey];
         });
 
         let params = {

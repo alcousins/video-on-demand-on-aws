@@ -40,7 +40,13 @@ exports.handler = async (event) => {
             inputRotate: process.env.InputRotate,
             acceleratedTranscoding: process.env.AcceleratedTranscoding,
             enableSns:JSON.parse(process.env.EnableSns),
-            enableSqs:JSON.parse(process.env.EnableSqs)
+            enableSqs:JSON.parse(process.env.EnableSqs),
+            // Subtitle processing configuration
+            subtitleConfig: {
+                enabled: JSON.parse(process.env.SUBTITLE_ENABLED || 'true'),
+                primaryLanguage: process.env.SUBTITLE_PRIMARY_LANGUAGE || 'auto',
+                targetLanguages: (process.env.SUBTITLE_TARGET_LANGUAGES || 'en,es,fr,de,it,pt,ja,ko,zh,ar').split(',')
+            }
         };
 
         switch (event.workflowTrigger) {

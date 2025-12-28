@@ -81,7 +81,7 @@ exports.handler = async (event) => {
         Key: {
             guid: guid
         },
-        UpdateExpression: 'SET workflowStatus = :st,' + 'workflowErrorAt = :ea,' + 'errorMessage = :em,' + 'errorDetails = :ed',
+        UpdateExpression: 'SET workflowStatus = :st, workflowErrorAt = :ea, errorMessage = :em, errorDetails = :ed',
         ExpressionAttributeValues: values
     };
 

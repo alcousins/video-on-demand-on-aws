@@ -31,13 +31,18 @@ exports.handler = async (event) => {
   let data = {};
 
   try {
-  // Get Config from DynamoDB (data required for the workflow)
-  let params = {
-    TableName: process.env.DynamoDBTable,
-    Key: {
-    guid: event.detail.userMetadata.guid,
+    // Validate event structure
+    if (!event.detail || !event.detail.userMetadata || !event.detail.userMetadata.guid) {
+      throw new Error('Invalid event structure: missing detail.userMetadata.guid');
     }
-  };
+
+    // Get Config from DynamoDB (data required for the workflow)
+    let params = {
+      TableName: process.env.DynamoDBTable,
+      Key: {
+        guid: event.detail.userMetadata.guid,
+      }
+    };
 
   data = await dynamo.get(params);
   data = data.Item;
@@ -47,66 +52,70 @@ exports.handler = async (event) => {
   data.endTime = new Date().toISOString();
 
   // Parse MediaConvert Output and generate CloudFront URLS.
-  event.detail.outputGroupDetails.forEach(output => {
-    console.log(`${output.type} found in outputs`);
+  // Check if outputGroupDetails exists (may be missing for subtitle-only workflows)
+  if (event.detail.outputGroupDetails && Array.isArray(event.detail.outputGroupDetails)) {
+    event.detail.outputGroupDetails.forEach(output => {
+      console.log(`${output.type} found in outputs`);
 
-    switch (output.type) {
-    case 'HLS_GROUP':
-      data.hlsPlaylist = output.playlistFilePaths[0];
-      data.hlsUrl = `https://${data.cloudFront}/${buildUrl(data.hlsPlaylist)}`;
+      switch (output.type) {
+      case 'HLS_GROUP':
+        data.hlsPlaylist = output.playlistFilePaths[0];
+        data.hlsUrl = `https://${data.cloudFront}/${buildUrl(data.hlsPlaylist)}`;
 
-      break;
+        break;
 
-    case 'DASH_ISO_GROUP':
-      data.dashPlaylist = output.playlistFilePaths[0];
-      data.dashUrl = `https://${data.cloudFront}/${buildUrl(data.dashPlaylist)}`;
+      case 'DASH_ISO_GROUP':
+        data.dashPlaylist = output.playlistFilePaths[0];
+        data.dashUrl = `https://${data.cloudFront}/${buildUrl(data.dashPlaylist)}`;
 
-      break;
+        break;
 
-    case 'FILE_GROUP':
-      let files = [];
-      let urls = [];
-      output.outputDetails.forEach((file) => {
+      case 'FILE_GROUP':
+        let files = [];
+        let urls = [];
+        output.outputDetails.forEach((file) => {
+          
+          if (file.outputFilePaths) {
+            files.push(file.outputFilePaths[0]);
+            urls.push(`https://${data.cloudFront}/${buildUrl(file.outputFilePaths[0])}`);
+          }
+        });
         
-        if (file.outputFilePaths) {
-          files.push(file.outputFilePaths[0]);
-          urls.push(`https://${data.cloudFront}/${buildUrl(file.outputFilePaths[0])}`);
+        if (files.length >0  && files[0].split('.').pop() === 'mp4') {
+        data.mp4Outputs = files;
+        data.mp4Urls = urls;
         }
-      });
-      
-      if (files.length >0  && files[0].split('.').pop() === 'mp4') {
-      data.mp4Outputs = files;
-      data.mp4Urls = urls;
+
+        break;
+
+      case 'MS_SMOOTH_GROUP':
+        data.mssPlaylist = output.playlistFilePaths[0];
+        data.mssUrl = `https://${data.cloudFront}/${buildUrl(data.mssPlaylist)}`;
+
+        break;
+
+      case 'CMAF_GROUP':
+        data.cmafDashPlaylist = output.playlistFilePaths[0];
+        data.cmafDashUrl = `https://${data.cloudFront}/${buildUrl(data.cmafDashPlaylist)}`;
+
+        data.cmafHlsPlaylist = output.playlistFilePaths[1];
+        data.cmafHlsUrl = `https://${data.cloudFront}/${buildUrl(data.cmafHlsPlaylist)}`;
+
+        break;
+
+      default:
+        throw new Error('Could not parse MediaConvert output');
       }
-
-      break;
-
-    case 'MS_SMOOTH_GROUP':
-      data.mssPlaylist = output.playlistFilePaths[0];
-      data.mssUrl = `https://${data.cloudFront}/${buildUrl(data.mssPlaylist)}`;
-
-      break;
-
-    case 'CMAF_GROUP':
-      data.cmafDashPlaylist = output.playlistFilePaths[0];
-      data.cmafDashUrl = `https://${data.cloudFront}/${buildUrl(data.cmafDashPlaylist)}`;
-
-      data.cmafHlsPlaylist = output.playlistFilePaths[1];
-      data.cmafHlsUrl = `https://${data.cloudFront}/${buildUrl(data.cmafHlsPlaylist)}`;
-
-      break;
-
-    default:
-      throw new Error('Could not parse MediaConvert output');
-    }
-  });
+    });
+  } else {
+    console.log('No outputGroupDetails found in event - this may be a subtitle-only workflow');
+  }
 
   /**
    * feature: if framcapture and accelerated are both enabled the tumbnails are not listed in the CloudWatch
    * output. adding a function to get the last image from the list of images.
    */
   if (data.frameCapture) {
-
     data.thumbNails = [];
     data.thumbNailsUrls = [];
 
@@ -117,19 +126,18 @@ exports.handler = async (event) => {
 
     let thumbNails = await s3.listObjects(params);
 
-    if (thumbNails.Contents.length !=0) {
+    if (thumbNails.Contents && thumbNails.Contents.length > 0) {
       let lastImg = thumbNails.Contents.pop();
       data.thumbNails.push(`s3://${data.destBucket}/${lastImg.Key}`);
       data.thumbNailsUrls.push(`https://${data.cloudFront}/${lastImg.Key}`);
     } else {
-        throw new Error('MediaConvert Thumbnails not found in S3');
+      console.log('MediaConvert Thumbnails not found in S3 - this may be expected for subtitle-only workflows');
     }
-    
   }
 
   } catch (err) {
-  await error.handler(event, err);
-  throw err;
+    await error.handler(event, err);
+    throw err;
   }
   return data;
 };

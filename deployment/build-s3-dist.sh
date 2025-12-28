@@ -61,6 +61,11 @@ cd "$template_dir/cdk-solution-helper"
 npm install --omit=dev
 
 echo "------------------------------------------------------------------------------"
+echo "[Init] Copy shared dependencies to Lambda functions"
+echo "------------------------------------------------------------------------------"
+"$template_dir/copy-shared-dependencies.sh"
+
+echo "------------------------------------------------------------------------------"
 echo "Download mediainfo binary for AWS Lambda"
 echo "------------------------------------------------------------------------------"
 cd "$source_dir/mediainfo/"
@@ -77,6 +82,13 @@ echo "--------------------------------------------------------------------------
 
 cd "$source_dir/cdk"
 npm install
+
+echo "------------------------------------------------------------------------------"
+echo "[Cleanup] Remove cached CDK JavaScript files to ensure fresh synthesis"
+echo "------------------------------------------------------------------------------"
+rm -f lib/*.js lib/*.d.ts bin/*.js bin/*.d.ts
+rm -rf cdk.out node_modules/.cache
+
 npm run cdk -- synth --output="$staging_dist_dir"
 if [ $? -ne 0 ]
 then
