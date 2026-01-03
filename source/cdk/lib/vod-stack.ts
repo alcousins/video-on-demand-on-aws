@@ -358,9 +358,48 @@ export class VideoOnDemand extends cdk.Stack {
     cfnDestination.cfnOptions.deletionPolicy = cdk.CfnDeletionPolicy.RETAIN;
     cfnDestination.cfnOptions.updateReplacePolicy = cdk.CfnDeletionPolicy.RETAIN;
 
+    /**
+     * Temporary bucket for subtitle processing staging
+     */
+    const subtitleTempBucket = new s3.Bucket(this, 'SubtitleTemp', {
+      serverAccessLogsBucket: logsBucket,
+      serverAccessLogsPrefix: 'subtitle-temp-bucket-logs/',
+      blockPublicAccess: new s3.BlockPublicAccess({
+        blockPublicAcls: true,
+        blockPublicPolicy: true,
+        ignorePublicAcls: true,
+        restrictPublicBuckets: true
+      }),
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      lifecycleRules: [
+        {
+          id: `${cdk.Aws.STACK_NAME}-subtitle-temp-cleanup`,
+          enabled: true,
+          expiration: cdk.Duration.days(7), // Clean up temporary subtitle files after 7 days
+          abortIncompleteMultipartUploadAfter: cdk.Duration.days(1)
+        }
+      ],
+      versioned: false, // No versioning needed for temporary files
+      enforceSSL: true,
+    });
+    const cfnSubtitleTempBucket = subtitleTempBucket.node.findChild('Resource') as s3.CfnBucket;
+    cfnSubtitleTempBucket.cfnOptions.deletionPolicy = cdk.CfnDeletionPolicy.DELETE;
+    cfnSubtitleTempBucket.cfnOptions.updateReplacePolicy = cdk.CfnDeletionPolicy.DELETE;
+
     //cdk_nag
     NagSuppressions.addResourceSuppressions(
       destination,
+      [
+        {
+          id: 'AwsSolutions-S10',
+          reason: 'Bucket is private and is not using HTTP'
+        }
+      ]
+    );
+
+    //cdk_nag
+    NagSuppressions.addResourceSuppressions(
+      subtitleTempBucket,
       [
         {
           id: 'AwsSolutions-S10',
@@ -636,7 +675,8 @@ export class VideoOnDemand extends cdk.Stack {
         new iam.PolicyStatement({
           resources: [
             `${source.bucketArn}/*`,
-            `${destination.bucketArn}/*`
+            `${destination.bucketArn}/*`,
+            `${subtitleTempBucket.bucketArn}/*`
           ],
           actions: [
             's3:GetObject',
@@ -1146,11 +1186,21 @@ export class VideoOnDemand extends cdk.Stack {
       statements: [
         new iam.PolicyStatement({
           resources: [dynamoDBTable.tableArn],
-          actions: ['dynamodb:UpdateItem']
+          actions: ['dynamodb:UpdateItem', 'dynamodb:GetItem']
         }),
         new iam.PolicyStatement({
           resources: [errorHandlerLambda.functionArn],
           actions: ['lambda:InvokeFunction']
+        }),
+        new iam.PolicyStatement({
+          resources: [
+            `${destination.bucketArn}/*`,
+            destination.bucketArn
+          ],
+          actions: [
+            's3:PutObject',
+            's3:PutObjectAcl'
+          ]
         }),
         new iam.PolicyStatement({
           resources: [`arn:${cdk.Aws.PARTITION}:logs:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:log-group:/aws/lambda/*`],
@@ -1196,7 +1246,8 @@ export class VideoOnDemand extends cdk.Stack {
         SOLUTION_IDENTIFIER: `AwsSolution/${solutionId}/%%VERSION%%`,
         AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
         ErrorHandler: errorHandlerLambda.functionArn,
-        DynamoDBTable: dynamoDBTable.tableName
+        DynamoDBTable: dynamoDBTable.tableName,
+        S3Bucket: destination.bucketName
       },
       role: dynamoUpdateRole,
       code: lambda.Code.fromAsset('../dynamo'),
@@ -2161,19 +2212,6 @@ export class VideoOnDemand extends cdk.Stack {
       lambdaFunction: sqsSendMessageLambda,
       payloadResponseOnly: true
     });
-    const subtitleProcessorTriggerTask = new tasks.LambdaInvoke(this, 'Subtitle Processor Trigger', {
-      lambdaFunction: stepFunctionsLambda,
-      payload: sfn.TaskInput.fromObject({
-        'guid.$': '$.guid',
-        'srcVideo.$': '$.srcVideo',
-        'srcBucket.$': '$.srcBucket',
-        'destBucket.$': '$.destBucket',
-        'subtitleConfig.$': '$.subtitleConfig',
-        'subtitleTrigger': true
-      }),
-      resultPath: '$.subtitleProcessorResult', // Store Lambda result in a separate field
-      payloadResponseOnly: false // Keep the original input data
-    });
     const completeState = new sfn.Pass(this, 'Complete');
 
     /**
@@ -2202,64 +2240,6 @@ export class VideoOnDemand extends cdk.Stack {
     //cdk_nag
     NagSuppressions.addResourceSuppressions(
       ingestWorkflow,
-      [
-        {
-          id: 'AwsSolutions-SF1',
-          reason: 'Logging handled by DynamoDB Update step and Error Handler lambda'
-        }, {
-          id: 'AwsSolutions-SF2',
-          reason: 'Optional configuration for this solution'
-        }
-      ]
-    );
-
-    /**
-     * ProcessWorkflow state machine
-     * 1: Profiler
-     * 2: Encoding Profile Check
-     *    3: Custom jobTemplate OR
-     *       jobTemplate 2160p OR
-     *       jobTemplate 1080p OR
-     *       jobTemplate 720p
-     * 4: Accelerated Transcoding Check
-     *    5: Enabled OR
-     *       Preferred OR
-     *       Disabled
-     * 6: Frame Capture Check
-     *    7: Frame Capture OR
-     *       No Frame Capture
-     * 8: Encode Job Submit
-     * 9: DynamoDB Update
-     */
-    const processWorkflowDefinition = profilerTask
-      .next(new sfn.Choice(this, 'Encoding Profile Check')
-        .when(sfn.Condition.booleanEquals('$.isCustomTemplate', true), new sfn.Pass(this, 'Custom jobTemplate'))
-        .when(sfn.Condition.numberEquals('$.encodingProfile', 2160), new sfn.Pass(this, 'jobTemplate 2160p'))
-        .when(sfn.Condition.numberEquals('$.encodingProfile', 1080), new sfn.Pass(this, 'jobTemplate 1080p'))
-        .when(sfn.Condition.numberEquals('$.encodingProfile', 720), new sfn.Pass(this, 'jobTemplate 720p'))
-        .afterwards())
-      .next(new sfn.Choice(this, 'Accelerated Transcoding Check')
-        .when(sfn.Condition.stringEquals('$.acceleratedTranscoding', 'ENABLED'), new sfn.Pass(this, 'Enabled'))
-        .when(sfn.Condition.stringEquals('$.acceleratedTranscoding', 'PREFERRED'), new sfn.Pass(this, 'Preferred'))
-        .when(sfn.Condition.stringEquals('$.acceleratedTranscoding', 'DISABLED'), new sfn.Pass(this, 'Disabled'))
-        .afterwards())
-      .next(new sfn.Choice(this, 'Frame Capture Check')
-        .when(sfn.Condition.booleanEquals('$.frameCapture', true), new sfn.Pass(this, 'Frame Capture'))
-        .when(sfn.Condition.booleanEquals('$.frameCapture', false), new sfn.Pass(this, 'No Frame Capture'))
-        .afterwards())
-      .next(encodeTask)
-      .next(subtitleProcessorTriggerTask)
-      .next(dynamodbUpdateTaskProcess);
-
-    const processWorkflow = new sfn.StateMachine(this, 'ProcessWorkflow', {
-      stateMachineName: `${cdk.Aws.STACK_NAME}-process`,
-      role: stepFunctionsServiceRole,
-      definitionBody: sfn.DefinitionBody.fromChainable(processWorkflowDefinition)
-    });
-
-    //cdk_nag
-    NagSuppressions.addResourceSuppressions(
-      processWorkflow,
       [
         {
           id: 'AwsSolutions-SF1',
@@ -2374,6 +2354,14 @@ export class VideoOnDemand extends cdk.Stack {
           actions: ['s3:GetObject']
         }),
         new iam.PolicyStatement({
+          resources: [subtitleTempBucket.bucketArn],
+          actions: ['s3:ListBucket']
+        }),
+        new iam.PolicyStatement({
+          resources: [`${subtitleTempBucket.bucketArn}/*`],
+          actions: ['s3:PutObject', 's3:GetObject']
+        }),
+        new iam.PolicyStatement({
           resources: [dynamoDBTable.tableArn],
           actions: ['dynamodb:GetItem', 'dynamodb:UpdateItem']
         }),
@@ -2431,6 +2419,8 @@ export class VideoOnDemand extends cdk.Stack {
         ErrorHandler: errorHandlerLambda.functionArn,
         DynamoDBTable: dynamoDBTable.tableName,
         Source: source.bucketName,
+        Destination: destination.bucketName,
+        SubtitleTempBucket: subtitleTempBucket.bucketName,
         SnsTopic: snsTopic.topicArn,
         SUBTITLE_PROCESSING_ENABLED: cdk.Fn.conditionIf(conditionEnableSubtitleProcessing.logicalId, 'true', 'false').toString(),
         SUBTITLE_PRIMARY_LANGUAGE: subtitlePrimaryLanguage.valueAsString,
@@ -2453,8 +2443,12 @@ export class VideoOnDemand extends cdk.Stack {
       policyName: `${cdk.Aws.STACK_NAME}-transcription-role`,
       statements: [
         new iam.PolicyStatement({
-          resources: [`${source.bucketArn}/*`, `${destination.bucketArn}/*`],
+          resources: [`${source.bucketArn}/*`, `${destination.bucketArn}/*`, `${subtitleTempBucket.bucketArn}/*`],
           actions: ['s3:GetObject', 's3:PutObject']
+        }),
+        new iam.PolicyStatement({
+          resources: [subtitleTempBucket.bucketArn],
+          actions: ['s3:ListBucket']
         }),
         new iam.PolicyStatement({
           resources: ['*'],
@@ -2470,6 +2464,10 @@ export class VideoOnDemand extends cdk.Stack {
         }),
         new iam.PolicyStatement({
           resources: [errorHandlerLambda.functionArn],
+          actions: ['lambda:InvokeFunction']
+        }),
+        new iam.PolicyStatement({
+          resources: [dynamoUpdateLambda.functionArn],
           actions: ['lambda:InvokeFunction']
         }),
         new iam.PolicyStatement({
@@ -2512,18 +2510,22 @@ export class VideoOnDemand extends cdk.Stack {
       handler: 'index.handler',
       functionName: `${cdk.Aws.STACK_NAME}-transcription`,
       description: 'Initiates and monitors AWS Transcribe jobs for video files',
+      timeout: cdk.Duration.seconds(900), // 15 minutes for long transcription jobs
+      memorySize: 2048, // Increased memory for 4-hour video processing
+      role: transcriptionRole,
+      code: lambda.Code.fromAsset('../transcription'),
       environment: {
         SOLUTION_IDENTIFIER: `AwsSolution/${solutionId}/%%VERSION%%`,
         AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
         ErrorHandler: errorHandlerLambda.functionArn,
         DynamoDBTable: dynamoDBTable.tableName,
+        DynamoDBLambda: dynamoUpdateLambda.functionArn,
         Source: source.bucketName,
-        Destination: destination.bucketName
-      },
-      role: transcriptionRole,
-      code: lambda.Code.fromAsset('../transcription'),
-      timeout: cdk.Duration.seconds(900), // 15 minutes for long transcription jobs
-      memorySize: 1024 // Increased memory for polling operations
+        Destination: destination.bucketName,
+        SubtitleTempBucket: subtitleTempBucket.bucketName,
+        SnsTopic: snsTopic.topicArn,
+        SqsQueue: sqsQueue.queueUrl
+      }
     });
     transcriptionLambda.node.addDependency(transcriptionRole);
     transcriptionLambda.node.addDependency(transcriptionPolicy);
@@ -2538,14 +2540,14 @@ export class VideoOnDemand extends cdk.Stack {
       policyName: `${cdk.Aws.STACK_NAME}-translation-coordinator-policy-v2`, // Force complete recreation
       statements: [
         new iam.PolicyStatement({
-          resources: [destination.bucketArn],
+          resources: [source.bucketArn, destination.bucketArn, subtitleTempBucket.bucketArn],
           actions: ['s3:ListBucket']
         }),
         new iam.PolicyStatement({
-          resources: [`${destination.bucketArn}/*`],
+          resources: [`${source.bucketArn}/*`, `${destination.bucketArn}/*`, `${subtitleTempBucket.bucketArn}/*`],
           actions: [
             's3:GetObject',
-            's3:PutObject' // Required for storing transcription segments
+            's3:PutObject' // Required for storing transcription segments and reading transcription results
           ]
         }),
         new iam.PolicyStatement({
@@ -2554,6 +2556,10 @@ export class VideoOnDemand extends cdk.Stack {
         }),
         new iam.PolicyStatement({
           resources: [errorHandlerLambda.functionArn],
+          actions: ['lambda:InvokeFunction']
+        }),
+        new iam.PolicyStatement({
+          resources: [dynamoUpdateLambda.functionArn],
           actions: ['lambda:InvokeFunction']
         }),
         new iam.PolicyStatement({
@@ -2601,7 +2607,9 @@ export class VideoOnDemand extends cdk.Stack {
         AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
         ErrorHandler: errorHandlerLambda.functionArn,
         DynamoDBTable: dynamoDBTable.tableName,
-        Destination: destination.bucketName
+        DynamoDBLambda: dynamoUpdateLambda.functionArn,
+        Destination: destination.bucketName,
+        SubtitleTempBucket: subtitleTempBucket.bucketName
       },
       role: translationCoordinatorRole,
       code: lambda.Code.fromAsset('../translation-coordinator'),
@@ -2628,13 +2636,13 @@ export class VideoOnDemand extends cdk.Stack {
           ]
         }),
         new iam.PolicyStatement({
-          resources: [destination.bucketArn],
+          resources: [source.bucketArn, destination.bucketArn, subtitleTempBucket.bucketArn],
           actions: ['s3:ListBucket']
         }),
         new iam.PolicyStatement({
-          resources: [`${destination.bucketArn}/*`],
+          resources: [`${source.bucketArn}/*`, `${destination.bucketArn}/*`, `${subtitleTempBucket.bucketArn}/*`],
           actions: [
-            's3:GetObject', // For retrieving transcription segments
+            's3:GetObject', // For retrieving transcription segments and translation tasks
             's3:PutObject'  // For storing translated segments
           ]
         }),
@@ -2645,6 +2653,18 @@ export class VideoOnDemand extends cdk.Stack {
         new iam.PolicyStatement({
           resources: [errorHandlerLambda.functionArn],
           actions: ['lambda:InvokeFunction']
+        }),
+        new iam.PolicyStatement({
+          resources: [dynamoUpdateLambda.functionArn],
+          actions: ['lambda:InvokeFunction']
+        }),
+        new iam.PolicyStatement({
+          resources: [snsTopic.topicArn],
+          actions: ['sns:Publish']
+        }),
+        new iam.PolicyStatement({
+          resources: [sqsQueue.queueArn],
+          actions: ['sqs:SendMessage']
         }),
         new iam.PolicyStatement({
           resources: [`arn:${cdk.Aws.PARTITION}:logs:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:log-group:/aws/lambda/*`],
@@ -2686,16 +2706,20 @@ export class VideoOnDemand extends cdk.Stack {
       handler: 'index.handler',
       functionName: `${cdk.Aws.STACK_NAME}-translation-worker`,
       description: 'Translates text segments for a specific target language',
+      timeout: cdk.Duration.seconds(600), // 10 minutes for translating many segments
+      memorySize: 1536, // Increased memory for 4-hour video processing
+      role: translationWorkerRole,
+      code: lambda.Code.fromAsset('../translation-worker'),
       environment: {
         SOLUTION_IDENTIFIER: `AwsSolution/${solutionId}/%%VERSION%%`,
         AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
         ErrorHandler: errorHandlerLambda.functionArn,
-        DynamoDBTable: dynamoDBTable.tableName
-      },
-      role: translationWorkerRole,
-      code: lambda.Code.fromAsset('../translation-worker'),
-      timeout: cdk.Duration.seconds(600), // 10 minutes for translating many segments
-      memorySize: 1024 // Processing translation batches
+        DynamoDBTable: dynamoDBTable.tableName,
+        DynamoDBLambda: dynamoUpdateLambda.functionArn,
+        SubtitleTempBucket: subtitleTempBucket.bucketName,
+        SnsTopic: snsTopic.topicArn,
+        SqsQueue: sqsQueue.queueUrl
+      }
     });
     translationWorkerLambda.node.addDependency(translationWorkerRole);
     translationWorkerLambda.node.addDependency(translationWorkerPolicy);
@@ -2710,15 +2734,16 @@ export class VideoOnDemand extends cdk.Stack {
       policyName: `${cdk.Aws.STACK_NAME}-webvtt-generator-policy-v2`, // Force complete recreation
       statements: [
         new iam.PolicyStatement({
-          resources: [destination.bucketArn],
+          resources: [source.bucketArn, destination.bucketArn, subtitleTempBucket.bucketArn],
           actions: ['s3:ListBucket']
         }),
         new iam.PolicyStatement({
-          resources: [`${destination.bucketArn}/*`],
+          resources: [`${source.bucketArn}/*`, `${destination.bucketArn}/*`, `${subtitleTempBucket.bucketArn}/*`],
           actions: [
-            's3:GetObject',    // For retrieving translated segments
+            's3:GetObject',    // For retrieving translated segments and translation results
             's3:PutObject', 
-            's3:PutObjectAcl'
+            's3:PutObjectAcl',
+            's3:PutObjectTagging'  // For adding lifecycle tags to uploaded WebVTT files
           ]
         }),
         new iam.PolicyStatement({
@@ -2727,6 +2752,10 @@ export class VideoOnDemand extends cdk.Stack {
         }),
         new iam.PolicyStatement({
           resources: [errorHandlerLambda.functionArn],
+          actions: ['lambda:InvokeFunction']
+        }),
+        new iam.PolicyStatement({
+          resources: [dynamoUpdateLambda.functionArn],
           actions: ['lambda:InvokeFunction']
         }),
         new iam.PolicyStatement({
@@ -2774,7 +2803,9 @@ export class VideoOnDemand extends cdk.Stack {
         AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1',
         ErrorHandler: errorHandlerLambda.functionArn,
         DynamoDBTable: dynamoDBTable.tableName,
+        DynamoDBLambda: dynamoUpdateLambda.functionArn,
         Destination: destination.bucketName,
+        SubtitleTempBucket: subtitleTempBucket.bucketName,
         CloudFront: distribution.cloudFrontWebDistribution.domainName
       },
       role: webvttGeneratorRole,
@@ -2813,6 +2844,48 @@ export class VideoOnDemand extends cdk.Stack {
       retention: logs.RetentionDays.ONE_WEEK
     });
 
+    // Add CDK nag suppressions for new subtitle processing Lambda functions
+    const cfnSubtitleConfigLambda = subtitleConfigLambda.node.findChild('Resource') as lambda.CfnFunction;
+    const cfnTranscriptionLambda = transcriptionLambda.node.findChild('Resource') as lambda.CfnFunction;
+    const cfnTranslationCoordinatorLambda = translationCoordinatorLambda.node.findChild('Resource') as lambda.CfnFunction;
+    const cfnTranslationWorkerLambda = translationWorkerLambda.node.findChild('Resource') as lambda.CfnFunction;
+    const cfnWebVTTGeneratorLambda = webvttGeneratorLambda.node.findChild('Resource') as lambda.CfnFunction;
+
+    [
+      cfnSubtitleConfigLambda,
+      cfnTranscriptionLambda,
+      cfnTranslationCoordinatorLambda,
+      cfnTranslationWorkerLambda,
+      cfnWebVTTGeneratorLambda,
+    ].forEach(lambdaFunction => {
+      lambdaFunction.cfnOptions.metadata = {
+        cfn_nag: {
+          rules_to_suppress: [
+            {
+              id: 'W58',
+              reason: 'Invalid warning: function has access to cloudwatch'
+            }, {
+              id: 'W89',
+              reason: 'This resource does not need to be deployed inside a VPC'
+            }, {
+              id: 'W92',
+              reason: 'This resource does not need to define ReservedConcurrentExecutions to reserve simultaneous executions'
+            }
+          ]
+        }
+      };
+
+      NagSuppressions.addResourceSuppressions(
+        lambdaFunction,
+        [
+          {
+            id: 'AwsSolutions-L1',
+            reason: 'Lambda NodeJS 22 Runtime in development...',
+          }
+        ]
+      );
+    });
+
     /**
      * Subtitle Processor State Machine
      * Handles transcription and translation of video content to generate WebVTT subtitle files
@@ -2832,6 +2905,188 @@ export class VideoOnDemand extends cdk.Stack {
       .replace(/\$\{DynamoUpdateLambdaArn\}/g, dynamoUpdateLambda.functionArn)
       .replace(/\$\{ErrorHandlerLambdaArn\}/g, errorHandlerLambda.functionArn)
       .replace(/\$\{StepFunctionsLambdaArn\}/g, stepFunctionsLambda.functionArn);
+
+    /**
+     * ProcessWorkflow state machine with integrated subtitle processing
+     * 1: Profiler
+     * 2: Subtitle Configuration Check
+     *    3: Subtitle Processing (if enabled) OR Skip to Encoding Profile Check
+     *       3a: Transcription
+     *       3b: Translation Coordinator
+     *       3c: Parallel Translation Tasks
+     *       3d: WebVTT Generation
+     * 4: Encoding Profile Check
+     *    5: Custom jobTemplate OR
+     *       jobTemplate 2160p OR
+     *       jobTemplate 1080p OR
+     *       jobTemplate 720p
+     * 6: Accelerated Transcoding Check
+     *    7: Enabled OR
+     *       Preferred OR
+     *       Disabled
+     * 8: Frame Capture Check
+     *    9: Frame Capture OR
+     *       No Frame Capture
+     * 10: Encode Job Submit (with subtitle files if available)
+     * 11: DynamoDB Update
+     */
+
+    // Define subtitle processing tasks
+    const subtitleConfigTask = new tasks.LambdaInvoke(this, 'Subtitle Configuration', {
+      lambdaFunction: subtitleConfigLambda,
+      resultPath: '$.subtitleConfigResult',
+      retryOnServiceExceptions: true
+    });
+
+    // Enhanced Step Function task configurations for 4-hour video support
+    const transcriptionTask = new tasks.LambdaInvoke(this, 'Transcription', {
+      lambdaFunction: transcriptionLambda,
+      payload: sfn.TaskInput.fromJsonPathAt('$.subtitleConfigResult.Payload'),
+      resultPath: '$.transcriptionResult',
+      taskTimeout: sfn.Timeout.duration(cdk.Duration.minutes(180)), // 3 hours for very long videos
+      retryOnServiceExceptions: true
+    });
+
+    const translationCoordinatorTask = new tasks.LambdaInvoke(this, 'Translation Coordinator', {
+      lambdaFunction: translationCoordinatorLambda,
+      payload: sfn.TaskInput.fromJsonPathAt('$.transcriptionResult.Payload'),
+      resultPath: '$.translationTasks',
+      taskTimeout: sfn.Timeout.duration(cdk.Duration.minutes(15)), // Increased for large transcripts
+      retryOnServiceExceptions: true
+    });
+
+    const parallelTranslationMap = new sfn.Map(this, 'Execute Parallel Translations', {
+      itemsPath: '$.translationTasks.Payload.parallelTranslationInput',
+      maxConcurrency: 5,
+      resultPath: '$.translationResults'
+    });
+
+    const translationWorkerTask = new tasks.LambdaInvoke(this, 'Translation Worker', {
+      lambdaFunction: translationWorkerLambda,
+      taskTimeout: sfn.Timeout.duration(cdk.Duration.minutes(20)), // Increased for 4-hour videos
+      retryOnServiceExceptions: true
+    });
+
+    parallelTranslationMap.itemProcessor(translationWorkerTask);
+
+    const webvttGeneratorTask = new tasks.LambdaInvoke(this, 'WebVTT Generator', {
+      lambdaFunction: webvttGeneratorLambda,
+      payload: sfn.TaskInput.fromObject({
+        'guid.$': '$.guid',
+        'srcVideo.$': '$.srcVideo',
+        'srcBucket.$': '$.srcBucket',
+        'destBucket.$': '$.destBucket',
+        'subtitleConfig.$': '$.subtitleConfigResult.Payload.subtitleConfig',
+        'transcriptionResult.$': '$.transcriptionResult.Payload',
+        'translationReferences.$': '$.translationResults'
+      }),
+      resultPath: '$.webvttResult',
+      taskTimeout: sfn.Timeout.duration(cdk.Duration.minutes(20)), // Increased for large files
+      retryOnServiceExceptions: true
+    });
+
+    // Define subtitle processing chain with error handling
+    const subtitleProcessingFailedState = new sfn.Pass(this, 'Subtitle Processing Failed', {
+      result: sfn.Result.fromObject({
+        subtitleProcessing: {
+          status: 'failed',
+          message: 'Subtitle processing failed, continuing with MediaConvert job'
+        }
+      }),
+      resultPath: '$.subtitleError'
+    });
+
+    const skipSubtitleProcessingState = new sfn.Pass(this, 'Skip Subtitle Processing', {
+      result: sfn.Result.fromObject({
+        subtitleProcessing: {
+          status: 'disabled',
+          message: 'Subtitle processing is disabled'
+        }
+      }),
+      resultPath: '$.subtitleResult'
+    });
+
+    // Add error handling to each subtitle processing task
+    transcriptionTask.addCatch(subtitleProcessingFailedState, {
+      errors: ['States.ALL'],
+      resultPath: '$.subtitleError'
+    });
+
+    translationCoordinatorTask.addCatch(subtitleProcessingFailedState, {
+      errors: ['States.ALL'],
+      resultPath: '$.subtitleError'
+    });
+
+    parallelTranslationMap.addCatch(subtitleProcessingFailedState, {
+      errors: ['States.ALL'],
+      resultPath: '$.subtitleError'
+    });
+
+    webvttGeneratorTask.addCatch(subtitleProcessingFailedState, {
+      errors: ['States.ALL'],
+      resultPath: '$.subtitleError'
+    });
+
+    const subtitleProcessingChain = transcriptionTask
+      .next(translationCoordinatorTask)
+      .next(parallelTranslationMap)
+      .next(webvttGeneratorTask);
+
+    // Create the encoding profile check chain
+    const encodingProfileCheck = new sfn.Choice(this, 'Encoding Profile Check')
+      .when(sfn.Condition.booleanEquals('$.isCustomTemplate', true), new sfn.Pass(this, 'Custom jobTemplate'))
+      .when(sfn.Condition.numberEquals('$.encodingProfile', 2160), new sfn.Pass(this, 'jobTemplate 2160p'))
+      .when(sfn.Condition.numberEquals('$.encodingProfile', 1080), new sfn.Pass(this, 'jobTemplate 1080p'))
+      .when(sfn.Condition.numberEquals('$.encodingProfile', 720), new sfn.Pass(this, 'jobTemplate 720p'))
+      .afterwards()
+      .next(new sfn.Choice(this, 'Accelerated Transcoding Check')
+        .when(sfn.Condition.stringEquals('$.acceleratedTranscoding', 'ENABLED'), new sfn.Pass(this, 'Enabled'))
+        .when(sfn.Condition.stringEquals('$.acceleratedTranscoding', 'PREFERRED'), new sfn.Pass(this, 'Preferred'))
+        .when(sfn.Condition.stringEquals('$.acceleratedTranscoding', 'DISABLED'), new sfn.Pass(this, 'Disabled'))
+        .afterwards())
+      .next(new sfn.Choice(this, 'Frame Capture Check')
+        .when(sfn.Condition.booleanEquals('$.frameCapture', true), new sfn.Pass(this, 'Frame Capture'))
+        .when(sfn.Condition.booleanEquals('$.frameCapture', false), new sfn.Pass(this, 'No Frame Capture'))
+        .afterwards())
+      .next(encodeTask)
+      .next(dynamodbUpdateTaskProcess);
+
+    // Connect subtitle processing to encoding profile check
+    subtitleProcessingChain.next(encodingProfileCheck);
+    skipSubtitleProcessingState.next(encodingProfileCheck);
+    subtitleProcessingFailedState.next(encodingProfileCheck);
+
+    const subtitleConfigChoice = new sfn.Choice(this, 'Subtitle Processing Enabled Check')
+      .when(
+        sfn.Condition.booleanEquals('$.subtitleConfigResult.Payload.subtitleConfig.enabled', true),
+        subtitleProcessingChain
+      )
+      .otherwise(skipSubtitleProcessingState);
+
+    // Define the main process workflow with subtitle processing integrated before MediaConvert
+    const processWorkflowDefinition = profilerTask
+      .next(subtitleConfigTask)
+      .next(subtitleConfigChoice);
+
+    const processWorkflow = new sfn.StateMachine(this, 'ProcessWorkflow', {
+      stateMachineName: `${cdk.Aws.STACK_NAME}-process`,
+      role: stepFunctionsServiceRole,
+      definitionBody: sfn.DefinitionBody.fromChainable(processWorkflowDefinition)
+    });
+
+    //cdk_nag
+    NagSuppressions.addResourceSuppressions(
+      processWorkflow,
+      [
+        {
+          id: 'AwsSolutions-SF1',
+          reason: 'Logging handled by DynamoDB Update step and Error Handler lambda'
+        }, {
+          id: 'AwsSolutions-SF2',
+          reason: 'Optional configuration for this solution'
+        }
+      ]
+    );
 
     const subtitleProcessorWorkflow = new sfn.StateMachine(this, 'SubtitleProcessorWorkflow', {
       stateMachineName: `${cdk.Aws.STACK_NAME}-subtitle-processor`,
@@ -2901,6 +3156,11 @@ export class VideoOnDemand extends cdk.Stack {
       value: destination.bucketName,
       description: 'Destination Bucket',
       exportName: `${cdk.Aws.STACK_NAME}:Destination`
+    });
+    new cdk.CfnOutput(this, 'SubtitleTempBucketName', { // NOSONAR
+      value: subtitleTempBucket.bucketName,
+      description: 'Subtitle Temporary Staging Bucket',
+      exportName: `${cdk.Aws.STACK_NAME}:SubtitleTempBucket`
     });
     new cdk.CfnOutput(this, 'CloudFrontDomainName', { // NOSONAR
       value: distribution.cloudFrontWebDistribution.domainName,

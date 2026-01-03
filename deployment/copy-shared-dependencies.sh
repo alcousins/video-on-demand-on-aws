@@ -23,15 +23,45 @@ subtitle_functions=(
     "webvtt-generator"
 )
 
-# Copy subtitle-utils.js to each function that needs it
+# Copy shared files to each function that needs them
 for func in "${subtitle_functions[@]}"; do
     if [ -d "$source_dir/$func" ]; then
-        echo "Copying subtitle-utils.js to $func"
+        echo "Copying shared files to $func"
         cp "$source_dir/shared/subtitle-utils.js" "$source_dir/$func/"
+        cp "$source_dir/shared/subtitle-error-handler.js" "$source_dir/$func/"
+        cp "$source_dir/shared/s3-storage-utils.js" "$source_dir/$func/"
+        
+        # Copy additional shared files based on function needs
+        case $func in
+            "transcription")
+                cp "$source_dir/shared/dynamo-subtitle-client.js" "$source_dir/$func/"
+                cp "$source_dir/shared/performance-optimizer.js" "$source_dir/$func/"
+                cp "$source_dir/shared/notification-integration.js" "$source_dir/$func/"
+                ;;
+            "translation-coordinator")
+                cp "$source_dir/shared/subtitle-types.js" "$source_dir/$func/"
+                cp "$source_dir/shared/performance-optimizer.js" "$source_dir/$func/"
+                cp "$source_dir/shared/notification-integration.js" "$source_dir/$func/"
+                ;;
+            "translation-worker")
+                cp "$source_dir/shared/subtitle-types.js" "$source_dir/$func/"
+                ;;
+            "webvtt-generator")
+                cp "$source_dir/shared/subtitle-types.js" "$source_dir/$func/"
+                cp "$source_dir/shared/s3-storage-utils.js" "$source_dir/$func/"
+                ;;
+        esac
     else
         echo "Warning: Directory $source_dir/$func not found"
     fi
 done
+
+# Also copy shared files to encode function
+if [ -d "$source_dir/encode" ]; then
+    echo "Copying shared files to encode"
+    cp "$source_dir/shared/subtitle-utils.js" "$source_dir/encode/"
+    cp "$source_dir/shared/s3-storage-utils.js" "$source_dir/encode/"
+fi
 
 echo "------------------------------------------------------------------------------"
 echo "[Copy Shared Dependencies] Complete"

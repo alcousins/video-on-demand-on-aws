@@ -11,37 +11,50 @@
  *  and limitations under the License.                                                                                *
  *********************************************************************************************************************/
 
-const {
-    Lambda
-} = require("@aws-sdk/client-lambda");
+const { DynamoDBDocument } = require("@aws-sdk/lib-dynamodb");
+const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+const { Lambda } = require("@aws-sdk/client-lambda");
 
-let errHandler = async (event, _err) => {
+exports.handler = async (event, err) => {
+    console.log(`ERROR:: ${JSON.stringify(err, null, 2)}`);
+
+    const dynamo = DynamoDBDocument.from(new DynamoDBClient({ 
+        region: process.env.AWS_REGION,
+        customUserAgent: process.env.SOLUTION_IDENTIFIER
+    }));
+
     const lambda = new Lambda({
-        region: process.env.AWS_REGION
+        region: process.env.AWS_REGION,
+        customUserAgent: process.env.SOLUTION_IDENTIFIER
     });
 
     try {
-        let payload = {
-            'guid': event.guid,
-            'event': event,
-            'function': process.env.AWS_LAMBDA_FUNCTION_NAME,
-            'error': _err.toString()
-        };
-
+        // Update DynamoDB with error status
         let params = {
-            FunctionName: process.env.ErrorHandler,
-            Payload: JSON.stringify(payload, null, 2)
+            TableName: process.env.DynamoDBTable,
+            Key: {
+                guid: event.guid,
+            },
+            UpdateExpression: 'set workflowStatus = :status, errorMessage = :error',
+            ExpressionAttributeValues: {
+                ':status': 'Error',
+                ':error': err.message
+            }
         };
 
-        await lambda.invoke(params);
-    } catch (err) {
-        console.log(err);
-        throw err;
+        await dynamo.update(params);
+
+        // Send error notification
+        if (process.env.ErrorHandler) {
+            params = {
+                FunctionName: process.env.ErrorHandler,
+                Payload: JSON.stringify(event, null, 2)
+            };
+
+            await lambda.invoke(params);
+        }
+
+    } catch (error) {
+        console.log(error);
     }
-
-    return 'success';
-};
-
-module.exports = {
-    handler: errHandler
 };

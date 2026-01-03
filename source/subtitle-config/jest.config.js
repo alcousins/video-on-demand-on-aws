@@ -1,12 +1,6 @@
 module.exports = {
-    testEnvironment: 'node',
-    collectCoverageFrom: [
-        '**/*.js',
-        '!jest.config.js',
-        '!coverage/**'
-    ],
-    coverageReporters: [
-        'text',
-        'lcov'
-    ]
-};
+    roots: ['<rootDir>/lib'],
+    testMatch: ['**/*.spec.js'],
+    coveragePathIgnorePatterns: ['<rootDir>/lib/utils.test.js'],
+    coverageReporters: [['lcov', { projectRoot: '../' }], 'text']
+  };

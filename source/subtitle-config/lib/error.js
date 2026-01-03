@@ -13,81 +13,48 @@
 
 const { DynamoDBDocument } = require("@aws-sdk/lib-dynamodb");
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
-const { SNS } = require("@aws-sdk/client-sns");
+const { Lambda } = require("@aws-sdk/client-lambda");
 
 exports.handler = async (event, err) => {
-    console.log(`ERROR:: ${JSON.stringify(event, null, 2)}`);
-    console.log(`ERROR:: ${err.toString()}`);
+    console.log(`ERROR:: ${JSON.stringify(err, null, 2)}`);
 
     const dynamo = DynamoDBDocument.from(new DynamoDBClient({ 
         region: process.env.AWS_REGION,
         customUserAgent: process.env.SOLUTION_IDENTIFIER
     }));
 
-    const sns = new SNS({
+    const lambda = new Lambda({
         region: process.env.AWS_REGION,
         customUserAgent: process.env.SOLUTION_IDENTIFIER
     });
 
-    let guid = event.guid || 'unknown';
-    let functionName = 'subtitle-config';
-    
-    // Create CloudWatch logs URL for debugging
-    const url = 'https://console.aws.amazon.com/cloudwatch/home?region=' + process.env.AWS_REGION + 
-                '#logStream:group=/aws/lambda/' + process.env.AWS_LAMBDA_FUNCTION_NAME;
-
-    // Prepare DynamoDB update values
-    const values = {
-        ':st': 'Error',
-        ':ea': functionName,
-        ':em': err.toString(),
-        ':ed': url,
-        ':ts': new Date().toISOString()
-    };
-
-    // Prepare SNS message to match existing error handler format
-    const msg = {
-        guid: guid,
-        workflowStatus: 'Error',
-        workflowErrorAt: functionName,
-        errorMessage: err.toString(),
-        errorDetails: url,
-        timestamp: new Date().toISOString(),
-        function: process.env.AWS_LAMBDA_FUNCTION_NAME
-    };
-
-    console.log(`ERROR REPORT:: ${JSON.stringify(msg, null, 2)}`);
-
     try {
-        // Update DynamoDB with error information
-        const params = {
+        // Update DynamoDB with error status
+        let params = {
             TableName: process.env.DynamoDBTable,
             Key: {
-                guid: guid
+                guid: event.guid,
             },
-            UpdateExpression: 'SET workflowStatus = :st, workflowErrorAt = :ea, errorMessage = :em, errorDetails = :ed, errorTimestamp = :ts',
-            ExpressionAttributeValues: values
+            UpdateExpression: 'set workflowStatus = :status, errorMessage = :error',
+            ExpressionAttributeValues: {
+                ':status': 'Error',
+                ':error': err.message
+            }
         };
 
         await dynamo.update(params);
-        console.log('Updated DynamoDB with error status');
 
-        // Send SNS notification if topic is configured
-        if (process.env.SnsTopic) {
-            const snsParams = {
-                Message: JSON.stringify(msg, null, 2),
-                Subject: `Subtitle Configuration Error: ${guid}`,
-                TargetArn: process.env.SnsTopic
+        // Send error notification
+        if (process.env.ErrorHandler) {
+            params = {
+                FunctionName: process.env.ErrorHandler,
+                Payload: JSON.stringify(event, null, 2)
             };
 
-            await sns.publish(snsParams);
-            console.log('Sent SNS error notification');
+            await lambda.invoke(params);
         }
 
-    } catch (handlerErr) {
-        console.error('Error in error handler:', handlerErr);
-        // Don't throw here to avoid recursive error handling
+    } catch (error) {
+        console.log(error);
     }
-
-    return event;
 };

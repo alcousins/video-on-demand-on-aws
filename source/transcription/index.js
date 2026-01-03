@@ -12,8 +12,8 @@
  *********************************************************************************************************************/
 
 const { TranscribeClient, StartTranscriptionJobCommand, GetTranscriptionJobCommand } = require("@aws-sdk/client-transcribe");
-const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
-const { DynamoDBDocumentClient, UpdateCommand } = require("@aws-sdk/lib-dynamodb");
+const { S3Client } = require("@aws-sdk/client-s3");
+const { createDynamoSubtitleClient } = require('./dynamo-subtitle-client.js');
 const error = require('./lib/error.js');
 const { 
     isVideoFormatSupported, 
@@ -27,25 +27,35 @@ const {
     SUBTITLE_ERROR_TYPES,
     PERFORMANCE_CONFIG
 } = require('./subtitle-utils.js');
+const { 
+    SubtitleErrorHandler,
+    handleSubtitleError,
+    createRetryWrapper
+} = require('./subtitle-error-handler.js');
+const {
+    calculateOptimizedTranscriptionTimeout,
+    createOptimizedPollingConfig,
+    monitorResourceUsage,
+    estimateVideoDurationFromSize,
+    NOTIFICATION_CONFIG
+} = require('./performance-optimizer.js');
+const {
+    sendSubtitleNotification,
+    sendProgressNotification
+} = require('./notification-integration.js');
+const {
+    createOptimizedS3Client,
+    storeJsonDataInS3,
+    generateTranscriptionResultsKey
+} = require('./s3-storage-utils.js');
 
 /**
  * Performance-optimized exponential backoff configuration for job polling
- * Dynamically adjusted based on estimated video duration
+ * Dynamically adjusted based on estimated video duration with 4-hour support
  */
 function createPollingConfig(estimatedDurationMinutes = 60) {
-    const baseConfig = PERFORMANCE_CONFIG.TRANSCRIPTION_TIMEOUTS;
-    
-    // Adjust polling frequency based on expected transcription time
-    // Longer videos need less frequent polling to avoid Lambda timeouts
-    const pollMultiplier = Math.min(3, Math.max(1, estimatedDurationMinutes / 30));
-    
-    return {
-        initialDelayMs: Math.floor(5000 * pollMultiplier),    // 5-15 seconds based on video length
-        maxDelayMs: Math.floor(300000 * pollMultiplier),      // 5-15 minutes based on video length
-        backoffMultiplier: 1.5, // Gentler backoff for long operations
-        maxAttempts: Math.max(10, Math.floor(estimatedDurationMinutes / 3)), // More attempts for longer videos
-        timeoutMs: calculateTranscriptionTimeout(estimatedDurationMinutes)
-    };
+    // Use enhanced performance optimizer for better 4-hour video support
+    return createOptimizedPollingConfig(estimatedDurationMinutes);
 }
 
 /**
@@ -60,15 +70,19 @@ const TRANSCRIBE_STATUS = {
 exports.handler = async (event) => {
     console.log(`REQUEST:: ${JSON.stringify(event, null, 2)}`);
 
+    // Create correlation ID for error tracking
+    const correlationId = SubtitleErrorHandler.getOrCreateCorrelationId(event, 'transcription');
+    console.log(`Processing transcription with correlation ID: ${correlationId}`);
+
+    // Initialize variables that need to be accessible in error handling
+    let estimatedDurationMinutes = 60; // Default assumption
+
     const transcribeClient = new TranscribeClient({
         region: process.env.AWS_REGION,
         customUserAgent: process.env.SOLUTION_IDENTIFIER
     });
 
-    const dynamoClient = new DynamoDBClient({
-        region: process.env.AWS_REGION
-    });
-    const docClient = DynamoDBDocumentClient.from(dynamoClient);
+    const dynamoClient = createDynamoSubtitleClient();
 
     try {
         // Validate input parameters
@@ -89,6 +103,7 @@ exports.handler = async (event) => {
                 {
                     guid: event.guid,
                     stage: 'transcription',
+                    correlationId,
                     configErrors: configResult.errors
                 }
             );
@@ -99,7 +114,7 @@ exports.handler = async (event) => {
 
         if (!configResult.config.enabled) {
             console.log('Subtitle processing is disabled, skipping transcription');
-            return event;
+            return { ...event, correlationId };
         }
 
         // Validate video format
@@ -110,27 +125,41 @@ exports.handler = async (event) => {
                 {
                     guid: event.guid,
                     stage: 'transcription',
+                    correlationId,
                     videoFile: event.srcVideo
                 }
             );
             
             logSubtitleError(errorReport);
             console.log(`Video format not supported for transcription: ${event.srcVideo}`);
-            await updateSubtitleProcessingStatus(docClient, event.guid, SUBTITLE_STATUS.FAILED, 
-                errorReport.errorMessage);
-            return event;
+            await dynamoClient.updateTranscriptionStatus(event.guid, 'FAILED', {
+                failureReason: errorReport.errorMessage
+            });
+            return { ...event, correlationId };
         }
 
-        // Estimate video duration for performance optimization
-        let estimatedDurationMinutes = 60; // Default assumption
-        
+        // Estimate video duration for performance optimization with enhanced accuracy
         // Try to get file size from event metadata for better duration estimation
         if (event.srcVideoSize || event.fileSize) {
             const fileSizeBytes = event.srcVideoSize || event.fileSize;
             const videoFormat = event.srcVideo.split('.').pop().toLowerCase();
-            estimatedDurationMinutes = estimateVideoDuration(fileSizeBytes, videoFormat);
-            console.log(`Estimated video duration: ${estimatedDurationMinutes} minutes based on file size: ${fileSizeBytes} bytes`);
+            estimatedDurationMinutes = estimateVideoDurationFromSize(fileSizeBytes, videoFormat);
+            console.log(`Enhanced estimated video duration: ${estimatedDurationMinutes} minutes based on file size: ${fileSizeBytes} bytes and format: ${videoFormat}`);
         }
+
+        // Send processing start notification
+        await sendSubtitleNotification(
+            NOTIFICATION_CONFIG.NOTIFICATION_TRIGGERS.PROCESSING_START,
+            {
+                guid: event.guid,
+                stage: 'transcription',
+                correlationId,
+                estimatedDuration: estimatedDurationMinutes,
+                srcVideo: event.srcVideo,
+                srcBucket: event.srcBucket,
+                destBucket: event.destBucket
+            }
+        );
 
         // Create performance-optimized polling configuration
         const pollingConfig = createPollingConfig(estimatedDurationMinutes);
@@ -190,36 +219,135 @@ exports.handler = async (event) => {
         }
 
         // Update DynamoDB with transcription start status
-        await updateSubtitleProcessingStatus(docClient, event.guid, SUBTITLE_STATUS.TRANSCRIBING, null, {
+        await dynamoClient.updateTranscriptionStatus(event.guid, 'STARTING', {
             transcriptionJobId: transcriptionJobName,
-            transcriptionStatus: 'STARTING'
-            // Note: processingStartTime is automatically set by the main update when status is TRANSCRIBING
+            correlationId
         });
 
-        // Start transcription job
+        // Create retry wrapper for transcription operations
+        const retryTranscriptionOperation = createRetryWrapper('transcription', {
+            correlationId,
+            estimatedDurationMinutes,
+            operationName: 'startTranscriptionJob'
+        });
+
+        // Start transcription job with retry logic
         console.log(`Starting transcription job: ${transcriptionJobName}`);
         console.log(`Transcription parameters: ${JSON.stringify(transcriptionParams, null, 2)}`);
         
-        const startJobCommand = new StartTranscriptionJobCommand(transcriptionParams);
-        await transcribeClient.send(startJobCommand);
+        await retryTranscriptionOperation(async () => {
+            const startJobCommand = new StartTranscriptionJobCommand(transcriptionParams);
+            return await transcribeClient.send(startJobCommand);
+        });
 
         // Poll for job completion with performance-optimized exponential backoff
-        const jobResult = await pollTranscriptionJob(transcribeClient, transcriptionJobName, pollingConfig);
+        const startTime = Date.now();
+        const jobResult = await pollTranscriptionJobWithRetry(
+            transcribeClient, 
+            transcriptionJobName, 
+            pollingConfig, 
+            correlationId,
+            startTime,
+            event
+        );
 
         if (jobResult.status === TRANSCRIBE_STATUS.COMPLETED) {
             console.log(`Transcription job completed successfully: ${transcriptionJobName}`);
             
-            // Update event with transcription results
-            event.transcriptionJobName = transcriptionJobName;
-            event.transcriptionOutputLocation = outputLocation;
-            event.detectedLanguage = jobResult.detectedLanguage;
+            // Send completion notification
+            await sendSubtitleNotification(
+                NOTIFICATION_CONFIG.NOTIFICATION_TRIGGERS.TRANSCRIPTION_COMPLETE,
+                {
+                    guid: event.guid,
+                    stage: 'transcription',
+                    correlationId,
+                    processingTime: jobResult.processingTimeSeconds,
+                    detectedLanguage: jobResult.detectedLanguage,
+                    srcVideo: event.srcVideo
+                }
+            );
             
-            // Update DynamoDB with completion status
-            await updateSubtitleProcessingStatus(docClient, event.guid, SUBTITLE_STATUS.COMPLETED, null, {
+            // Store full transcription results in S3 to avoid Step Functions payload limits
+            const s3Client = createOptimizedS3Client(process.env.AWS_REGION, process.env.SOLUTION_IDENTIFIER);
+            const tempBucket = event.subtitleConfig?.tempBucket || event.srcBucket;
+            const transcriptionResultsKey = generateTranscriptionResultsKey(event.guid);
+            
+            const fullTranscriptionResults = {
+                guid: event.guid,
+                transcriptionJobName,
+                transcriptionOutputLocation: outputLocation,
+                detectedLanguage: jobResult.detectedLanguage,
+                estimatedDurationMinutes,
+                processingTimeSeconds: jobResult.processingTimeSeconds,
+                correlationId,
+                // Store all original event data that might be needed downstream
+                srcVideo: event.srcVideo,
+                srcBucket: event.srcBucket,
+                destBucket: event.destBucket,
+                subtitleConfig: event.subtitleConfig,
+                // Add any other relevant fields from the original event
+                acceleratedTranscoding: event.acceleratedTranscoding,
+                archiveSource: event.archiveSource,
+                cloudFront: event.cloudFront,
+                enableMediaPackage: event.enableMediaPackage,
+                enableSns: event.enableSns,
+                enableSqs: event.enableSqs,
+                frameCapture: event.frameCapture,
+                inputRotate: event.inputRotate,
+                jobTemplate_1080p: event.jobTemplate_1080p,
+                jobTemplate_2160p: event.jobTemplate_2160p,
+                jobTemplate_720p: event.jobTemplate_720p,
+                srcMediainfo: event.srcMediainfo,
+                startTime: event.startTime,
+                workflowName: event.workflowName,
+                workflowStatus: event.workflowStatus,
+                workflowTrigger: event.workflowTrigger,
+                srcHeight: event.srcHeight,
+                srcWidth: event.srcWidth,
+                encodingProfile: event.encodingProfile,
+                jobTemplate: event.jobTemplate,
+                isCustomTemplate: event.isCustomTemplate
+            };
+            
+            const s3StorageResult = await storeJsonDataInS3(
+                s3Client,
+                tempBucket,
+                transcriptionResultsKey,
+                fullTranscriptionResults,
+                {
+                    dataType: 'transcription-results',
+                    guid: event.guid,
+                    stage: 'transcription'
+                }
+            );
+            
+            console.log(`Stored transcription results in S3: ${s3StorageResult.s3Location}`);
+            
+            // Return minimal event with S3 reference instead of full data
+            const minimalResult = {
+                guid: event.guid,
+                transcriptionJobName,
+                transcriptionOutputLocation: outputLocation,
+                detectedLanguage: jobResult.detectedLanguage,
+                estimatedDurationMinutes,
+                correlationId,
+                // S3 reference for full results
+                transcriptionResultsS3Location: s3StorageResult.s3Location,
+                transcriptionResultsBucket: tempBucket,
+                transcriptionResultsKey: transcriptionResultsKey
+            };
+            
+            // Update DynamoDB with completion status including S3 reference
+            await dynamoClient.updateTranscriptionStatus(event.guid, 'COMPLETED', {
                 transcriptionJobId: transcriptionJobName,
-                transcriptionStatus: 'COMPLETED',
-                detectedLanguage: jobResult.detectedLanguage
+                detectedLanguage: jobResult.detectedLanguage,
+                outputLocation: outputLocation,
+                processingTimeSeconds: jobResult.processingTimeSeconds,
+                correlationId,
+                resultsS3Location: s3StorageResult.s3Location
             });
+
+            return minimalResult;
 
         } else {
             const errorMessage = `Transcription job failed: ${jobResult.failureReason || 'Unknown error'}`;
@@ -231,6 +359,7 @@ exports.handler = async (event) => {
                 {
                     guid: event.guid,
                     stage: 'transcription',
+                    correlationId,
                     jobName: transcriptionJobName,
                     failureReason: jobResult.failureReason
                 }
@@ -238,9 +367,10 @@ exports.handler = async (event) => {
             
             logSubtitleError(errorReport);
             
-            await updateSubtitleProcessingStatus(docClient, event.guid, SUBTITLE_STATUS.FAILED, errorMessage, {
+            await dynamoClient.updateTranscriptionStatus(event.guid, 'FAILED', {
                 transcriptionJobId: transcriptionJobName,
-                transcriptionStatus: 'FAILED'
+                failureReason: jobResult.failureReason,
+                correlationId
             });
             
             throw new Error(errorMessage);
@@ -249,54 +379,129 @@ exports.handler = async (event) => {
     } catch (err) {
         console.error('Transcription Lambda error:', err);
         
-        // Create structured error report
-        const errorReport = createSubtitleErrorReport(
-            SUBTITLE_ERROR_TYPES.TRANSCRIPTION_ERROR,
-            err.message,
-            {
-                guid: event.guid,
-                stage: 'transcription',
-                errorMessage: err.message,
-                stack: err.stack
-            }
-        );
-        
-        logSubtitleError(errorReport);
-        
+        // Use the new centralized error handling system
+        const errorHandlingResult = await handleSubtitleError(event, err, {
+            stage: 'transcription',
+            correlationId,
+            functionName: process.env.AWS_LAMBDA_FUNCTION_NAME,
+            estimatedDurationMinutes: estimatedDurationMinutes
+        });
+
         // Update DynamoDB with error status
         try {
-            await updateSubtitleProcessingStatus(docClient, event.guid, SUBTITLE_STATUS.FAILED, err.message);
+            await dynamoClient.updateSubtitleError(event.guid, err.message, errorHandlingResult.correlationId);
         } catch (dbErr) {
             console.error('Failed to update DynamoDB with error status:', dbErr);
         }
         
-        await error.handler(event, err);
-        throw err;
+        // If this is a critical error that should fail the workflow
+        if (errorHandlingResult.shouldFailWorkflow) {
+            throw err;
+        }
+
+        // For non-critical errors, return minimal event to continue workflow without subtitles
+        console.log(`Non-critical transcription error, continuing workflow without subtitles: ${err.message}`);
+        return { 
+            guid: event.guid,
+            correlationId: errorHandlingResult.correlationId,
+            subtitleProcessingFailed: true,
+            subtitleError: err.message
+        };
     }
 
-    return event;
+    // This should not be reached, but return minimal event as fallback
+    return {
+        guid: event.guid,
+        correlationId,
+        subtitleProcessingFailed: true,
+        subtitleError: 'Unknown error in transcription processing'
+    };
 };
 
 /**
- * Polls transcription job status with performance-optimized exponential backoff
+ * Polls transcription job status with performance-optimized exponential backoff and retry logic
+ * Enhanced with resource monitoring and progress notifications for 4-hour video support
  * @param {TranscribeClient} transcribeClient - AWS Transcribe client
  * @param {string} jobName - Transcription job name
  * @param {Object} pollingConfig - Performance-optimized polling configuration
+ * @param {string} correlationId - Correlation ID for error tracking
+ * @param {number} startTime - Processing start time for resource monitoring
+ * @param {Object} event - Original Lambda event for progress notifications
  * @returns {Promise<Object>} Job result with status and details
  */
-async function pollTranscriptionJob(transcribeClient, jobName, pollingConfig) {
+async function pollTranscriptionJobWithRetry(transcribeClient, jobName, pollingConfig, correlationId, startTime, event) {
+    const retryPollingOperation = createRetryWrapper('transcription', {
+        correlationId,
+        operationName: 'pollTranscriptionJob'
+    });
+
+    return await retryPollingOperation(async () => {
+        return await pollTranscriptionJob(transcribeClient, jobName, pollingConfig, startTime, event);
+    });
+}
+
+/**
+ * Polls transcription job status with performance-optimized exponential backoff
+ * Enhanced with resource monitoring and progress notifications for 4-hour video support
+ * @param {TranscribeClient} transcribeClient - AWS Transcribe client
+ * @param {string} jobName - Transcription job name
+ * @param {Object} pollingConfig - Performance-optimized polling configuration
+ * @param {number} startTime - Processing start time for resource monitoring
+ * @param {Object} event - Original Lambda event for progress notifications
+ * @returns {Promise<Object>} Job result with status and details
+ */
+async function pollTranscriptionJob(transcribeClient, jobName, pollingConfig, startTime, event) {
     let attempt = 0;
     let delayMs = pollingConfig.initialDelayMs;
-    const startTime = Date.now();
+    let lastProgressNotification = startTime;
+    const progressNotificationInterval = 10 * 60 * 1000; // 10 minutes
 
-    console.log(`Starting transcription job polling with timeout: ${pollingConfig.timeoutMs}ms`);
+    console.log(`Starting enhanced transcription job polling with timeout: ${pollingConfig.timeoutMs}ms`);
 
     while (attempt < pollingConfig.maxAttempts) {
+        const currentTime = Date.now();
+        const elapsedTime = currentTime - startTime;
+        
         // Check for overall timeout to prevent Lambda timeout
-        const elapsedTime = Date.now() - startTime;
         if (elapsedTime > pollingConfig.timeoutMs) {
             console.warn(`Transcription polling timed out after ${elapsedTime}ms`);
             throw new Error(`Transcription job polling timed out after ${Math.floor(elapsedTime / 1000)} seconds. Job may still be processing.`);
+        }
+
+        // Monitor resource usage and send progress notifications for long-running jobs
+        if (process.env.AWS_LAMBDA_FUNCTION_NAME) {
+            const mockContext = {
+                getRemainingTimeInMillis: () => Math.max(0, pollingConfig.timeoutMs - elapsedTime)
+            };
+            
+            const resourceUsage = monitorResourceUsage(mockContext, startTime);
+            
+            // Send progress notification every 10 minutes for long videos
+            if (currentTime - lastProgressNotification > progressNotificationInterval) {
+                await sendProgressNotification({
+                    guid: event.guid,
+                    stage: 'transcription',
+                    correlationId: event.correlationId,
+                    elapsedTimeSeconds: Math.floor(elapsedTime / 1000),
+                    estimatedDurationMinutes: event.estimatedDurationMinutes || 60,
+                    progressPercent: Math.min(90, (elapsedTime / pollingConfig.timeoutMs) * 100),
+                    resourceUsage
+                });
+                lastProgressNotification = currentTime;
+            }
+            
+            // Check for critical resource usage
+            if (resourceUsage.recommendations.criticalResourceUsage) {
+                console.warn('Critical resource usage detected during transcription polling');
+                await sendProgressNotification({
+                    guid: event.guid,
+                    stage: 'transcription',
+                    correlationId: event.correlationId,
+                    elapsedTimeSeconds: Math.floor(elapsedTime / 1000),
+                    estimatedDurationMinutes: event.estimatedDurationMinutes || 60,
+                    resourceUsage
+                });
+            }
         }
 
         try {
@@ -329,12 +534,13 @@ async function pollTranscriptionJob(transcribeClient, jobName, pollingConfig) {
 
             // Job is still in progress, wait before next poll
             if (job.TranscriptionJobStatus === TRANSCRIBE_STATUS.IN_PROGRESS) {
-                // Adaptive delay: increase delay for longer-running jobs to reduce API calls
+                // Enhanced adaptive delay: increase delay for longer-running jobs to reduce API calls
+                // and optimize for 4-hour video processing
                 const adaptiveDelay = Math.min(
                     delayMs,
                     pollingConfig.maxDelayMs,
                     // Increase delay based on elapsed time to reduce API calls for long jobs
-                    Math.max(delayMs, Math.floor(elapsedTime / 10))
+                    Math.max(delayMs, Math.floor(elapsedTime / 20))
                 );
                 
                 console.log(`Waiting ${adaptiveDelay}ms before next poll (adaptive delay based on ${Math.floor(elapsedTime / 1000)}s elapsed)...`);
@@ -348,9 +554,9 @@ async function pollTranscriptionJob(transcribeClient, jobName, pollingConfig) {
         } catch (err) {
             console.error(`Error polling transcription job (attempt ${attempt + 1}):`, err);
             
-            // Check if this is a throttling error and adjust delay accordingly
+            // Enhanced throttling handling for long-running jobs
             if (err.name === 'ThrottlingException' || err.name === 'TooManyRequestsException') {
-                const throttleDelay = Math.min(delayMs * 3, pollingConfig.maxDelayMs);
+                const throttleDelay = Math.min(delayMs * 4, pollingConfig.maxDelayMs); // Increased multiplier
                 console.log(`Throttling detected, using extended delay: ${throttleDelay}ms`);
                 await sleep(throttleDelay);
             } else {
@@ -368,85 +574,6 @@ async function pollTranscriptionJob(transcribeClient, jobName, pollingConfig) {
 
     const elapsedTime = Date.now() - startTime;
     throw new Error(`Transcription job polling exceeded maximum attempts (${pollingConfig.maxAttempts}) after ${Math.floor(elapsedTime / 1000)} seconds`);
-}
-
-/**
- * Updates subtitle processing status in DynamoDB using shared utilities
- * @param {DynamoDBDocumentClient} docClient - DynamoDB document client
- * @param {string} guid - Video processing job GUID
- * @param {string} status - Processing status
- * @param {string} errorDetails - Error details (optional)
- * @param {Object} additionalFields - Additional fields to update (optional)
- */
-async function updateSubtitleProcessingStatus(docClient, guid, status, errorDetails = null, additionalFields = {}) {
-    try {
-        // Split into two separate updates to avoid any potential path conflicts
-        
-        // First update: Set the main status and timing fields
-        const mainUpdateExpression = ['SET subtitleProcessingStatus = :status'];
-        const mainExpressionAttributeValues = { ':status': status };
-
-        // Add timestamp
-        mainUpdateExpression.push('subtitleProcessingLastUpdated = :timestamp');
-        mainExpressionAttributeValues[':timestamp'] = new Date().toISOString();
-
-        // Add processing start time if status is starting
-        if (status === SUBTITLE_STATUS.PENDING || status === SUBTITLE_STATUS.TRANSCRIBING) {
-            mainUpdateExpression.push('subtitleProcessingStartTime = :startTime');
-            mainExpressionAttributeValues[':startTime'] = new Date().toISOString();
-        }
-
-        // Add processing end time if status is completed or failed
-        if (status === SUBTITLE_STATUS.COMPLETED || status === SUBTITLE_STATUS.FAILED) {
-            mainUpdateExpression.push('subtitleProcessingEndTime = :endTime');
-            mainExpressionAttributeValues[':endTime'] = new Date().toISOString();
-        }
-
-        // Add error details if provided
-        if (errorDetails) {
-            mainUpdateExpression.push('subtitleErrorDetails = :errorDetails');
-            mainExpressionAttributeValues[':errorDetails'] = errorDetails;
-        }
-
-        const mainParams = {
-            TableName: process.env.DynamoDBTable,
-            Key: { guid },
-            UpdateExpression: mainUpdateExpression.join(', '),
-            ExpressionAttributeValues: mainExpressionAttributeValues
-        };
-
-        await docClient.send(new UpdateCommand(mainParams));
-
-        // Second update: Set additional fields if any (to avoid conflicts)
-        if (Object.keys(additionalFields).length > 0) {
-            const additionalUpdateExpression = [];
-            const additionalExpressionAttributeValues = {};
-
-            let fieldIndex = 0;
-            Object.keys(additionalFields).forEach((key) => {
-                const valueName = `:value${fieldIndex}`;
-                const fieldName = `subtitle${key.charAt(0).toUpperCase() + key.slice(1)}`;
-                
-                additionalUpdateExpression.push(`${fieldName} = ${valueName}`);
-                additionalExpressionAttributeValues[valueName] = additionalFields[key];
-                fieldIndex++;
-            });
-
-            const additionalParams = {
-                TableName: process.env.DynamoDBTable,
-                Key: { guid },
-                UpdateExpression: 'SET ' + additionalUpdateExpression.join(', '),
-                ExpressionAttributeValues: additionalExpressionAttributeValues
-            };
-
-            await docClient.send(new UpdateCommand(additionalParams));
-        }
-
-        console.log(`Updated subtitle processing status for ${guid}: ${status}`);
-    } catch (err) {
-        console.error(`Failed to update subtitle processing status for ${guid}:`, err);
-        throw err;
-    }
 }
 
 /**

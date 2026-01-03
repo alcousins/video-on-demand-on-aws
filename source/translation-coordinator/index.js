@@ -11,23 +11,39 @@
  *  and limitations under the License.                                                                                *
  *********************************************************************************************************************/
 
-const { S3Client, GetObjectCommand, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 const { DynamoDBDocumentClient, UpdateCommand } = require("@aws-sdk/lib-dynamodb");
 const error = require('./lib/error.js');
 const { 
-    isLanguageSupported, 
-    validateAndNormalizeSubtitleConfig, 
-    createTranslationStatusUpdate, 
+    validateAndNormalizeSubtitleConfig,
     createSubtitleErrorReport,
     logSubtitleError,
+    optimizeTranslationBatching,
     SUBTITLE_STATUS,
-    SUBTITLE_ERROR_TYPES
+    SUBTITLE_ERROR_TYPES,
+    SUPPORTED_LANGUAGES
 } = require('./subtitle-utils.js');
-
-/**
- * Subtitle processing status constants are imported from shared utilities
- */
+const { 
+    createTranslationTask,
+    createTextSegment,
+    isValidTextSegment
+} = require('./subtitle-types.js');
+const {
+    createOptimizedTranslationBatchConfig,
+    monitorResourceUsage,
+    NOTIFICATION_CONFIG
+} = require('./performance-optimizer.js');
+const {
+    sendSubtitleNotification,
+    sendProgressNotification
+} = require('./notification-integration.js');
+const {
+    createOptimizedS3Client,
+    getJsonDataFromS3,
+    storeJsonDataInS3,
+    generateTranslationTaskKey
+} = require('./s3-storage-utils.js');
 
 exports.handler = async (event) => {
     console.log(`REQUEST:: ${JSON.stringify(event, null, 2)}`);
@@ -44,14 +60,37 @@ exports.handler = async (event) => {
 
     try {
         // Validate input parameters
-        if (!event.guid || !event.transcriptionJobName || !event.transcriptionOutputLocation) {
-            throw new Error('Missing required parameters: guid, transcriptionJobName, or transcriptionOutputLocation');
+        if (!event.guid) {
+            throw new Error('Missing required parameter: guid');
         }
 
-        // Check if subtitle processing is enabled and validate configuration
-        const subtitleConfig = event.subtitleConfig || { enabled: false };
-        
-        // Enhanced validation with detailed error reporting
+        // Check if we have S3 reference for transcription results
+        let fullTranscriptionData;
+        if (event.transcriptionResultsS3Location) {
+            // Load full transcription data from S3
+            console.log(`Loading transcription results from S3: ${event.transcriptionResultsS3Location}`);
+            const s3Client = createOptimizedS3Client(process.env.AWS_REGION, process.env.SOLUTION_IDENTIFIER);
+            
+            fullTranscriptionData = await getJsonDataFromS3(
+                s3Client,
+                event.transcriptionResultsBucket,
+                event.transcriptionResultsKey
+            );
+            
+            console.log(`Successfully loaded transcription data from S3 for guid: ${event.guid}`);
+        } else {
+            // Fallback to inline data (for backward compatibility)
+            if (!event.transcriptionJobName || !event.transcriptionOutputLocation) {
+                throw new Error('Missing required parameters: transcriptionJobName, transcriptionOutputLocation, or transcriptionResultsS3Location');
+            }
+            fullTranscriptionData = event;
+        }
+
+        // Use the full transcription data for processing
+        const transcriptionJobName = fullTranscriptionData.transcriptionJobName;
+        const transcriptionOutputLocation = fullTranscriptionData.transcriptionOutputLocation;
+        const detectedLanguage = fullTranscriptionData.detectedLanguage;
+        const subtitleConfig = fullTranscriptionData.subtitleConfig || { enabled: false };
         const configResult = validateAndNormalizeSubtitleConfig(subtitleConfig);
         
         if (!configResult.isValid) {
@@ -60,7 +99,7 @@ exports.handler = async (event) => {
                 `Invalid subtitle configuration: ${configResult.errors.join(', ')}`,
                 {
                     guid: event.guid,
-                    stage: 'translation-coordination',
+                    stage: 'translation-coordinator',
                     configErrors: configResult.errors
                 }
             );
@@ -74,75 +113,206 @@ exports.handler = async (event) => {
             return event;
         }
 
-        // Validate target languages exist
-        if (!configResult.config.targetLanguages || configResult.config.targetLanguages.length === 0) {
-            console.log('No target languages configured, skipping translation');
+        // Check if we have target languages for translation
+        const targetLanguages = configResult.config.targetLanguages || [];
+        const sourceLanguage = detectedLanguage || configResult.config.primaryLanguage || 'en';
+        
+        // Filter out the source language from target languages to avoid translating to the same language
+        const languagesToTranslate = targetLanguages.filter(lang => {
+            // Handle language code variations (e.g., en-US vs en)
+            const normalizedSource = sourceLanguage.split('-')[0].toLowerCase();
+            const normalizedTarget = lang.split('-')[0].toLowerCase();
+            return normalizedSource !== normalizedTarget;
+        });
+
+        if (languagesToTranslate.length === 0) {
+            console.log('No target languages for translation (source language matches all targets), skipping translation');
+            // Update status to indicate translation was skipped
+            await updateTranslationStatus(docClient, event.guid, 'SKIPPED', {
+                reason: 'No target languages different from source language',
+                sourceLanguage: sourceLanguage,
+                targetLanguages: targetLanguages
+            });
+            
+            // Set empty translation tasks array
+            event.translationTasks = [];
             return event;
         }
 
-        // Update DynamoDB with translation start status
-        await updateSubtitleProcessingStatus(docClient, event.guid, SUBTITLE_STATUS.TRANSLATING, null, {
-            translationStatus: 'STARTING'
+        console.log(`Source language: ${sourceLanguage}, Target languages: ${languagesToTranslate.join(', ')}`);
+
+        // Update DynamoDB with translation coordination start status
+        await updateTranslationStatus(docClient, event.guid, 'STARTING', {
+            sourceLanguage: sourceLanguage,
+            targetLanguages: languagesToTranslate,
+            transcriptionJobName: transcriptionJobName
         });
 
-        // Parse transcription output location to get S3 bucket and key
-        const transcriptionS3Location = parseS3Location(event.transcriptionOutputLocation);
+        // Parse transcription output to extract text segments
+        const textSegments = await parseTranscriptionOutput(s3Client, transcriptionOutputLocation, transcriptionJobName);
         
-        // Download and parse transcription JSON
-        console.log(`Downloading transcription results from: ${transcriptionS3Location.bucket}/${transcriptionS3Location.key}`);
-        const transcriptionData = await downloadTranscriptionResults(s3Client, transcriptionS3Location.bucket, transcriptionS3Location.key, event.transcriptionJobName);
-        
-        // Extract text segments with timing information
-        const textSegments = extractTextSegments(transcriptionData);
+        if (!textSegments || textSegments.length === 0) {
+            const errorMessage = 'No text segments found in transcription output';
+            console.error(errorMessage);
+            
+            const errorReport = createSubtitleErrorReport(
+                SUBTITLE_ERROR_TYPES.TRANSLATION_ERROR,
+                errorMessage,
+                {
+                    guid: event.guid,
+                    stage: 'translation-coordinator',
+                    transcriptionJobName: event.transcriptionJobName,
+                    outputLocation: event.transcriptionOutputLocation
+                }
+            );
+            
+            logSubtitleError(errorReport);
+            
+            await updateTranslationStatus(docClient, event.guid, 'FAILED', {
+                errorMessage: errorMessage
+            });
+            
+            throw new Error(errorMessage);
+        }
+
         console.log(`Extracted ${textSegments.length} text segments from transcription`);
 
-        if (textSegments.length === 0) {
-            console.log('No text segments found in transcription, skipping translation');
-            await updateSubtitleProcessingStatus(docClient, event.guid, SUBTITLE_STATUS.COMPLETED, null, {
-                translationStatus: 'SKIPPED_NO_TEXT'
-            });
-            return event;
-        }
+        // Enhanced performance optimization with 4-hour video support
+        const estimatedDurationMinutes = event.estimatedDurationMinutes || 60;
+        const averageSegmentLength = textSegments.reduce((sum, segment) => sum + segment.text.length, 0) / textSegments.length;
+        
+        // Use enhanced optimization for better 4-hour video support
+        const optimizedBatchConfig = createOptimizedTranslationBatchConfig(textSegments.length, estimatedDurationMinutes);
+        
+        console.log(`Enhanced translation optimization: ${textSegments.length} segments, avg length: ${Math.round(averageSegmentLength)}, optimized batch size: ${optimizedBatchConfig.batchSize}, concurrent limit: ${optimizedBatchConfig.maxConcurrentRequests}`);
 
-        // Determine source language
-        const sourceLanguage = determineSourceLanguage(event.detectedLanguage, configResult.config.primaryLanguage);
-        console.log(`Source language determined as: ${sourceLanguage}`);
-
-        // Store text segments in S3 to avoid Step Functions output size limits
-        const transcriptionS3Key = await storeTranscriptionSegments(s3Client, event, textSegments, sourceLanguage);
-
-        // Generate parallel translation tasks for target languages (without text segments)
-        const translationTasks = generateTranslationTasks(
-            sourceLanguage,
-            configResult.config.targetLanguages,
-            transcriptionS3Key, // Pass S3 reference instead of segments
-            event.guid
+        // Send processing start notification
+        await sendSubtitleNotification(
+            NOTIFICATION_CONFIG.NOTIFICATION_TRIGGERS.PROCESSING_START,
+            {
+                guid: event.guid,
+                stage: 'translation-coordinator',
+                correlationId: event.correlationId,
+                languageCount: languagesToTranslate.length,
+                segmentCount: textSegments.length,
+                estimatedDuration: estimatedDurationMinutes
+            }
         );
 
-        console.log(`Generated ${translationTasks.length} translation tasks for languages: ${configResult.config.targetLanguages.join(', ')}`);
+        // Generate parallel translation tasks for each target language
+        const translationTasks = [];
+        
+        for (const targetLanguage of languagesToTranslate) {
+            // Validate that the target language is supported
+            if (!SUPPORTED_LANGUAGES[targetLanguage]) {
+                console.warn(`Unsupported target language: ${targetLanguage}, skipping`);
+                continue;
+            }
 
-        // Prepare output for Step Functions parallel execution (minimal data)
-        const result = {
-            ...event,
-            sourceLanguage,
-            transcriptionS3Key, // Reference to S3 location instead of full segments
+            // Create translation task with optimized batching
+            const taskId = `${event.guid}-${sourceLanguage}-to-${targetLanguage}-${Date.now()}`;
+            
+            const translationTask = createTranslationTask(
+                sourceLanguage,
+                targetLanguage,
+                textSegments,
+                taskId,
+                {
+                    guid: event.guid,
+                    transcriptionJobName: event.transcriptionJobName,
+                    batchConfig: optimizedBatchConfig, // Use optimized config
+                    segmentCount: textSegments.length,
+                    averageSegmentLength: averageSegmentLength,
+                    estimatedDurationMinutes: estimatedDurationMinutes,
+                    correlationId: event.correlationId
+                }
+            );
+
+            translationTasks.push(translationTask);
+            console.log(`Created translation task: ${taskId} (${sourceLanguage} -> ${targetLanguage})`);
+        }
+
+        if (translationTasks.length === 0) {
+            const errorMessage = 'No valid translation tasks could be created';
+            console.error(errorMessage);
+            
+            await updateTranslationStatus(docClient, event.guid, 'FAILED', {
+                errorMessage: errorMessage,
+                reason: 'All target languages were unsupported'
+            });
+            
+            throw new Error(errorMessage);
+        }
+
+        // Update DynamoDB with translation tasks ready status
+        await updateTranslationStatus(docClient, event.guid, 'TASKS_READY', {
+            taskCount: translationTasks.length,
+            sourceLanguage: sourceLanguage,
+            targetLanguages: languagesToTranslate,
             segmentCount: textSegments.length,
-            translationTasks,
-            parallelTranslationInput: translationTasks.map(task => ({
-                ...event,
-                translationTask: task
-            }))
-        };
-
-        // Update DynamoDB with translation coordination completion
-        await updateSubtitleProcessingStatus(docClient, event.guid, SUBTITLE_STATUS.TRANSLATING, null, {
-            translationStatus: 'COORDINATED',
-            sourceLanguage,
-            targetLanguages: configResult.config.targetLanguages,
-            textSegmentCount: textSegments.length
+            batchConfig: optimizedBatchConfig, // Use optimized config
+            estimatedDurationMinutes: estimatedDurationMinutes
         });
 
-        console.log('Translation coordination completed successfully');
+        // Store translation tasks in S3 to avoid Step Functions payload limits
+        const tempBucket = fullTranscriptionData.subtitleConfig?.tempBucket || fullTranscriptionData.srcBucket;
+        const parallelTranslationInput = [];
+        
+        for (const translationTask of translationTasks) {
+            // Store each task in S3
+            const taskKey = generateTranslationTaskKey(event.guid, translationTask.taskId);
+            
+            const s3StorageResult = await storeJsonDataInS3(
+                s3Client,
+                tempBucket,
+                taskKey,
+                translationTask,
+                {
+                    dataType: 'translation-task',
+                    guid: event.guid,
+                    stage: 'translation-coordinator'
+                }
+            );
+            
+            // Create minimal reference for Step Functions
+            parallelTranslationInput.push({
+                taskId: translationTask.taskId,
+                sourceLanguage: translationTask.sourceLanguage,
+                targetLanguage: translationTask.targetLanguage,
+                s3Location: s3StorageResult.s3Location,
+                s3Bucket: tempBucket,
+                s3Key: taskKey,
+                segmentCount: translationTask.textSegments?.length || 0
+            });
+            
+            console.log(`Stored translation task in S3: ${s3StorageResult.s3Location}`);
+        }
+
+        // Send coordination complete notification
+        await sendSubtitleNotification(
+            NOTIFICATION_CONFIG.NOTIFICATION_TRIGGERS.PROCESSING_COMPLETE,
+            {
+                guid: event.guid,
+                stage: 'translation-coordinator',
+                correlationId: fullTranscriptionData.correlationId,
+                languageCount: translationTasks.length,
+                segmentCount: textSegments.length,
+                processingTime: Math.floor((Date.now() - (fullTranscriptionData.startTime || Date.now())) / 1000)
+            }
+        );
+
+        // Return minimal data with S3 references for parallel execution
+        const result = {
+            guid: event.guid,
+            sourceLanguage: sourceLanguage,
+            segmentCount: textSegments.length,
+            batchConfig: optimizedBatchConfig,
+            estimatedDurationMinutes: estimatedDurationMinutes,
+            parallelTranslationInput: parallelTranslationInput,
+            translationTasksCount: translationTasks.length
+        };
+
+        console.log(`Translation coordination completed: ${translationTasks.length} tasks stored in S3 for parallel execution`);
         return result;
 
     } catch (err) {
@@ -154,7 +324,7 @@ exports.handler = async (event) => {
             err.message,
             {
                 guid: event.guid,
-                stage: 'translation-coordination',
+                stage: 'translation-coordinator',
                 errorMessage: err.message,
                 stack: err.stack
             }
@@ -164,8 +334,8 @@ exports.handler = async (event) => {
         
         // Update DynamoDB with error status
         try {
-            await updateSubtitleProcessingStatus(docClient, event.guid, SUBTITLE_STATUS.FAILED, err.message, {
-                translationStatus: 'FAILED'
+            await updateTranslationStatus(docClient, event.guid, 'FAILED', {
+                errorMessage: err.message
             });
         } catch (dbErr) {
             console.error('Failed to update DynamoDB with error status:', dbErr);
@@ -174,352 +344,209 @@ exports.handler = async (event) => {
         await error.handler(event, err);
         throw err;
     }
+
+    return event;
 };
 
 /**
- * Stores transcription segments in S3 to avoid Step Functions output size limits
+ * Parses AWS Transcribe output to extract text segments with timing information
  * @param {S3Client} s3Client - AWS S3 client
- * @param {Object} event - Lambda event
- * @param {Array} textSegments - Array of text segments with timing
- * @param {string} sourceLanguage - Source language code
- * @returns {Promise<string>} S3 key where segments were stored
+ * @param {string} outputLocation - S3 location of transcription output
+ * @param {string} jobName - Transcription job name
+ * @returns {Promise<Array>} Array of text segments with timing information
  */
-async function storeTranscriptionSegments(s3Client, event, textSegments, sourceLanguage) {
+async function parseTranscriptionOutput(s3Client, outputLocation, jobName) {
     try {
-        // Generate S3 key for transcription segments
-        const s3Key = `transcriptions/${event.guid}/segments.json`;
+        // AWS Transcribe stores the JSON output with the job name
+        const transcriptKey = `${outputLocation.replace('s3://', '').split('/').slice(1).join('/')}${jobName}.json`;
+        const bucketName = outputLocation.replace('s3://', '').split('/')[0];
         
-        // Prepare the data to store
-        const transcriptionData = {
-            guid: event.guid,
-            sourceLanguage: sourceLanguage,
-            segmentCount: textSegments.length,
-            textSegments: textSegments,
-            transcriptionJobName: event.transcriptionJobName,
-            detectedLanguage: event.detectedLanguage,
-            timestamp: new Date().toISOString(),
-            version: '1.0'
-        };
+        console.log(`Fetching transcription output from s3://${bucketName}/${transcriptKey}`);
 
-        const jsonContent = JSON.stringify(transcriptionData, null, 2);
-        
-        console.log(`Storing ${textSegments.length} transcription segments in S3: ${s3Key}`);
+        const getObjectCommand = new GetObjectCommand({
+            Bucket: bucketName,
+            Key: transcriptKey
+        });
 
-        // Use the destination bucket directly (where we have permissions)
-        const bucket = event.destBucket;
+        const response = await s3Client.send(getObjectCommand);
+        const transcriptData = JSON.parse(await streamToString(response.Body));
+
+        console.log(`Transcription data structure: ${Object.keys(transcriptData).join(', ')}`);
+
+        // Extract segments from AWS Transcribe JSON format
+        const textSegments = [];
         
-        if (!bucket) {
-            throw new Error('Destination bucket not available in event');
+        if (transcriptData.results && transcriptData.results.items) {
+            // Group words into segments based on punctuation and pauses
+            let currentSegment = {
+                startTime: null,
+                endTime: null,
+                words: []
+            };
+
+            for (const item of transcriptData.results.items) {
+                if (item.type === 'pronunciation' && item.start_time && item.end_time) {
+                    // Initialize segment start time
+                    if (currentSegment.startTime === null) {
+                        currentSegment.startTime = parseFloat(item.start_time) * 1000; // Convert to milliseconds
+                    }
+                    
+                    // Update segment end time
+                    currentSegment.endTime = parseFloat(item.end_time) * 1000; // Convert to milliseconds
+                    currentSegment.words.push(item.alternatives[0].content);
+
+                    // Check if this word ends a sentence (contains punctuation)
+                    const content = item.alternatives[0].content;
+                    const endsSegment = /[.!?]$/.test(content) || currentSegment.words.length >= 15; // Max 15 words per segment
+
+                    if (endsSegment) {
+                        // Create text segment
+                        const text = currentSegment.words.join(' ');
+                        if (text.trim().length > 0) {
+                            const segment = createTextSegment(
+                                currentSegment.startTime,
+                                currentSegment.endTime,
+                                text.trim(),
+                                {
+                                    confidence: item.alternatives[0].confidence || 1.0
+                                }
+                            );
+
+                            if (isValidTextSegment(segment)) {
+                                textSegments.push(segment);
+                            }
+                        }
+
+                        // Reset for next segment
+                        currentSegment = {
+                            startTime: null,
+                            endTime: null,
+                            words: []
+                        };
+                    }
+                } else if (item.type === 'punctuation' && currentSegment.words.length > 0) {
+                    // Add punctuation to the last word
+                    const lastWordIndex = currentSegment.words.length - 1;
+                    currentSegment.words[lastWordIndex] += item.alternatives[0].content;
+                }
+            }
+
+            // Handle any remaining words in the last segment
+            if (currentSegment.words.length > 0 && currentSegment.startTime !== null) {
+                const text = currentSegment.words.join(' ');
+                if (text.trim().length > 0) {
+                    const segment = createTextSegment(
+                        currentSegment.startTime,
+                        currentSegment.endTime,
+                        text.trim()
+                    );
+
+                    if (isValidTextSegment(segment)) {
+                        textSegments.push(segment);
+                    }
+                }
+            }
         }
 
-        const putObjectCommand = new PutObjectCommand({
-            Bucket: bucket, // Use destination bucket where we have permissions
-            Key: s3Key,
-            Body: jsonContent,
-            ContentType: 'application/json',
-            ContentEncoding: 'utf-8',
-            Metadata: {
-                'guid': event.guid,
-                'source-language': sourceLanguage,
-                'segment-count': textSegments.length.toString(),
-                'generated-by': 'translation-coordinator',
-                'timestamp': new Date().toISOString()
+        // If no segments were created from items, try to use the transcript text with estimated timing
+        if (textSegments.length === 0 && transcriptData.results && transcriptData.results.transcripts) {
+            console.log('No timed segments found, creating segments from full transcript');
+            
+            const fullTranscript = transcriptData.results.transcripts[0]?.transcript || '';
+            if (fullTranscript.trim().length > 0) {
+                // Split transcript into sentences and create estimated timing
+                const sentences = fullTranscript.split(/[.!?]+/).filter(s => s.trim().length > 0);
+                const estimatedDurationPerChar = 100; // 100ms per character (rough estimate)
+                
+                let currentTime = 0;
+                for (const sentence of sentences) {
+                    const text = sentence.trim();
+                    if (text.length > 0) {
+                        const duration = text.length * estimatedDurationPerChar;
+                        const segment = createTextSegment(
+                            currentTime,
+                            currentTime + duration,
+                            text
+                        );
+
+                        if (isValidTextSegment(segment)) {
+                            textSegments.push(segment);
+                        }
+                        
+                        currentTime += duration + 500; // Add 500ms pause between sentences
+                    }
+                }
             }
-        });
+        }
 
-        await s3Client.send(putObjectCommand);
-        
-        console.log(`Successfully stored transcription segments in S3: s3://${bucket}/${s3Key}`);
-        
-        return s3Key;
+        console.log(`Parsed ${textSegments.length} text segments from transcription output`);
+        return textSegments;
+
     } catch (err) {
-        console.error(`Failed to store transcription segments in S3:`, err);
-        throw new Error(`Failed to store transcription segments: ${err.message}`);
+        console.error('Error parsing transcription output:', err);
+        throw new Error(`Failed to parse transcription output: ${err.message}`);
     }
 }
 
 /**
- * Parses S3 location string to extract bucket and key
- * @param {string} s3Location - S3 location string (s3://bucket/key)
- * @returns {Object} Object with bucket and key properties
+ * Updates translation coordination status in DynamoDB
+ * @param {DynamoDBDocumentClient} docClient - DynamoDB document client
+ * @param {string} guid - Video processing job GUID
+ * @param {string} status - Translation coordination status
+ * @param {Object} additionalFields - Additional fields to update
  */
-function parseS3Location(s3Location) {
-    if (!s3Location || !s3Location.startsWith('s3://')) {
-        throw new Error(`Invalid S3 location format: ${s3Location}`);
-    }
-    
-    const locationParts = s3Location.replace('s3://', '').split('/');
-    const bucket = locationParts[0];
-    const key = locationParts.slice(1).join('/');
-    
-    if (!bucket || !key) {
-        throw new Error(`Invalid S3 location format: ${s3Location}`);
-    }
-    
-    return { bucket, key };
-}
-
-/**
- * Downloads transcription results from S3
- * @param {S3Client} s3Client - AWS S3 client
- * @param {string} bucket - S3 bucket name
- * @param {string} key - S3 object key (directory path)
- * @param {string} transcriptionJobName - AWS Transcribe job name (used as filename)
- * @returns {Promise<Object>} Parsed transcription JSON data
- */
-async function downloadTranscriptionResults(s3Client, bucket, key, transcriptionJobName) {
+async function updateTranslationStatus(docClient, guid, status, additionalFields = {}) {
     try {
-        // AWS Transcribe outputs files with the job name as the filename
-        // The key parameter is the directory path, we need to append the job name + .json
-        const jsonKey = key.endsWith('/') ? `${key}${transcriptionJobName}.json` : `${key}/${transcriptionJobName}.json`;
-        
-        console.log(`Downloading transcription JSON from: ${bucket}/${jsonKey}`);
-        
-        const getObjectCommand = new GetObjectCommand({
-            Bucket: bucket,
-            Key: jsonKey
+        const updateExpression = ['SET subtitleTranslationStatus = :status'];
+        const expressionAttributeValues = { ':status': status };
+
+        // Add timestamp
+        updateExpression.push('subtitleTranslationLastUpdated = :timestamp');
+        expressionAttributeValues[':timestamp'] = new Date().toISOString();
+
+        // Update overall subtitle processing status
+        if (status === 'STARTING' || status === 'TASKS_READY') {
+            updateExpression.push('subtitleProcessingStatus = :processingStatus');
+            expressionAttributeValues[':processingStatus'] = SUBTITLE_STATUS.TRANSLATING;
+        } else if (status === 'FAILED') {
+            updateExpression.push('subtitleProcessingStatus = :processingStatus');
+            expressionAttributeValues[':processingStatus'] = SUBTITLE_STATUS.FAILED;
+        }
+
+        // Add additional fields
+        Object.keys(additionalFields).forEach((key, index) => {
+            const valueName = `:value${index}`;
+            const fieldName = `subtitleTranslation${key.charAt(0).toUpperCase() + key.slice(1)}`;
+            
+            updateExpression.push(`${fieldName} = ${valueName}`);
+            expressionAttributeValues[valueName] = additionalFields[key];
         });
-        
-        const response = await s3Client.send(getObjectCommand);
-        const transcriptionText = await streamToString(response.Body);
-        
-        return JSON.parse(transcriptionText);
+
+        const params = {
+            TableName: process.env.DynamoDBTable,
+            Key: { guid },
+            UpdateExpression: updateExpression.join(', '),
+            ExpressionAttributeValues: expressionAttributeValues
+        };
+
+        await docClient.send(new UpdateCommand(params));
+        console.log(`Updated translation status for ${guid}: ${status}`);
+
     } catch (err) {
-        console.error(`Failed to download transcription results from ${bucket}/${key}:`, err);
-        throw new Error(`Failed to download transcription results: ${err.message}`);
+        console.error(`Failed to update translation status for ${guid}:`, err);
+        throw err;
     }
 }
 
 /**
  * Converts a readable stream to string
- * @param {ReadableStream} stream - Readable stream
- * @returns {Promise<string>} String content
+ * @param {ReadableStream} stream - The readable stream
+ * @returns {Promise<string>} The stream content as string
  */
 async function streamToString(stream) {
     const chunks = [];
     for await (const chunk of stream) {
-        // Handle both Buffer and string chunks
-        chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+        chunks.push(chunk);
     }
     return Buffer.concat(chunks).toString('utf-8');
-}
-
-/**
- * Extracts text segments with timing information from transcription data
- * @param {Object} transcriptionData - AWS Transcribe JSON output
- * @returns {Array} Array of text segments with startTime, endTime, and text
- */
-function extractTextSegments(transcriptionData) {
-    if (!transcriptionData || !transcriptionData.results) {
-        throw new Error('Invalid transcription data format');
-    }
-    
-    const segments = [];
-    const items = transcriptionData.results.items || [];
-    
-    // Group items into segments based on punctuation or natural breaks
-    let currentSegment = {
-        startTime: null,
-        endTime: null,
-        words: []
-    };
-    
-    for (const item of items) {
-        if (item.type === 'pronunciation' && item.start_time && item.end_time) {
-            // Initialize segment start time if not set
-            if (currentSegment.startTime === null) {
-                currentSegment.startTime = parseFloat(item.start_time) * 1000; // Convert to milliseconds
-            }
-            
-            // Update segment end time
-            currentSegment.endTime = parseFloat(item.end_time) * 1000; // Convert to milliseconds
-            
-            // Add word to current segment
-            currentSegment.words.push(item.alternatives[0].content);
-            
-            // Check if this word ends a sentence (contains punctuation)
-            const content = item.alternatives[0].content;
-            if (content.match(/[.!?]$/)) {
-                // End current segment
-                if (currentSegment.words.length > 0) {
-                    segments.push({
-                        startTime: currentSegment.startTime,
-                        endTime: currentSegment.endTime,
-                        text: currentSegment.words.join(' ')
-                    });
-                }
-                
-                // Start new segment
-                currentSegment = {
-                    startTime: null,
-                    endTime: null,
-                    words: []
-                };
-            }
-        } else if (item.type === 'punctuation' && currentSegment.words.length > 0) {
-            // Add punctuation to the last word
-            const lastWordIndex = currentSegment.words.length - 1;
-            currentSegment.words[lastWordIndex] += item.alternatives[0].content;
-        }
-    }
-    
-    // Add any remaining segment
-    if (currentSegment.words.length > 0 && currentSegment.startTime !== null) {
-        segments.push({
-            startTime: currentSegment.startTime,
-            endTime: currentSegment.endTime,
-            text: currentSegment.words.join(' ')
-        });
-    }
-    
-    // If no segments were created (no punctuation), create segments based on word count
-    if (segments.length === 0 && items.length > 0) {
-        const wordsPerSegment = 10; // Reasonable segment size
-        let segmentWords = [];
-        let segmentStartTime = null;
-        let segmentEndTime = null;
-        
-        for (const item of items) {
-            if (item.type === 'pronunciation' && item.start_time && item.end_time) {
-                if (segmentStartTime === null) {
-                    segmentStartTime = parseFloat(item.start_time) * 1000;
-                }
-                segmentEndTime = parseFloat(item.end_time) * 1000;
-                segmentWords.push(item.alternatives[0].content);
-                
-                if (segmentWords.length >= wordsPerSegment) {
-                    segments.push({
-                        startTime: segmentStartTime,
-                        endTime: segmentEndTime,
-                        text: segmentWords.join(' ')
-                    });
-                    
-                    segmentWords = [];
-                    segmentStartTime = null;
-                }
-            }
-        }
-        
-        // Add remaining words as final segment
-        if (segmentWords.length > 0 && segmentStartTime !== null) {
-            segments.push({
-                startTime: segmentStartTime,
-                endTime: segmentEndTime,
-                text: segmentWords.join(' ')
-            });
-        }
-    }
-    
-    return segments;
-}
-
-/**
- * Determines the source language for translation
- * @param {string} detectedLanguage - Language detected by AWS Transcribe
- * @param {string} configuredLanguage - Language configured in subtitle config
- * @returns {string} Source language code
- */
-function determineSourceLanguage(detectedLanguage, configuredLanguage) {
-    // If a specific language was configured, use it
-    if (configuredLanguage && configuredLanguage !== 'auto') {
-        return configuredLanguage;
-    }
-    
-    // Use detected language, but map AWS Transcribe codes to our standard codes
-    if (detectedLanguage) {
-        const languageMapping = {
-            'en-US': 'en',
-            'en-GB': 'en',
-            'es-US': 'es',
-            'es-ES': 'es',
-            'fr-FR': 'fr',
-            'fr-CA': 'fr',
-            'de-DE': 'de',
-            'it-IT': 'it',
-            'pt-BR': 'pt-BR',
-            'pt-PT': 'pt',
-            'ja-JP': 'ja',
-            'ko-KR': 'ko',
-            'zh-CN': 'zh',
-            'ar-SA': 'ar'
-        };
-        
-        return languageMapping[detectedLanguage] || detectedLanguage.split('-')[0];
-    }
-    
-    // Default to English if no language information is available
-    return 'en';
-}
-
-/**
- * Generates parallel translation tasks for target languages
- * @param {string} sourceLanguage - Source language code
- * @param {Array} targetLanguages - Array of target language codes
- * @param {string} transcriptionS3Key - S3 key where text segments are stored
- * @param {string} jobId - Job identifier
- * @returns {Array} Array of translation tasks
- */
-function generateTranslationTasks(sourceLanguage, targetLanguages, transcriptionS3Key, jobId) {
-    const tasks = [];
-    
-    for (const targetLanguage of targetLanguages) {
-        // Skip if target language is the same as source language
-        if (targetLanguage === sourceLanguage) {
-            console.log(`Skipping translation for ${targetLanguage} as it matches source language`);
-            continue;
-        }
-        
-        // Validate target language is supported
-        if (!isLanguageSupported(targetLanguage)) {
-            console.warn(`Target language ${targetLanguage} is not supported, skipping`);
-            continue;
-        }
-        
-        // Create translation task with S3 reference instead of full segments
-        const task = {
-            sourceLanguage,
-            targetLanguage,
-            transcriptionS3Key, // Reference to S3 location instead of full segments
-            jobId: `${jobId}-${sourceLanguage}-to-${targetLanguage}`
-        };
-        
-        tasks.push(task);
-    }
-    
-    return tasks;
-}
-
-/**
- * Updates subtitle processing status in DynamoDB using shared utilities
- * @param {DynamoDBDocumentClient} docClient - DynamoDB document client
- * @param {string} guid - Video processing job GUID
- * @param {string} status - Processing status
- * @param {string} errorDetails - Error details (optional)
- * @param {Object} additionalFields - Additional fields to update (optional)
- */
-async function updateSubtitleProcessingStatus(docClient, guid, status, errorDetails = null, additionalFields = {}) {
-    try {
-        const fieldsToUpdate = { ...additionalFields };
-        if (errorDetails) {
-            fieldsToUpdate.errorDetails = errorDetails;
-        }
-        
-        // Extract translationStatus from additionalFields to avoid duplication
-        const { translationStatus, ...otherFields } = fieldsToUpdate;
-        const translationStatusValue = translationStatus || status;
-        
-        const updateParams = createTranslationStatusUpdate(translationStatusValue, otherFields);
-        
-        const params = {
-            TableName: process.env.DynamoDBTable,
-            Key: { guid },
-            ...updateParams
-        };
-
-        await docClient.send(new UpdateCommand(params));
-        console.log(`Updated subtitle processing status for ${guid}: ${status}`);
-    } catch (err) {
-        console.error(`Failed to update subtitle processing status for ${guid}:`, err);
-        throw err;
-    }
 }

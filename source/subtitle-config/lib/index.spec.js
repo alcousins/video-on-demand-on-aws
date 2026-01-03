@@ -11,296 +11,241 @@
  *  and limitations under the License.                                                                                *
  *********************************************************************************************************************/
 
-const { handler } = require('../index');
-const { 
-    buildSubtitleConfig,
-    validateAndNormalizeSubtitleConfig,
-    createSubtitleErrorReport,
-    SUBTITLE_ERROR_TYPES
-} = require('../../shared/subtitle-utils');
+const expect = require('chai').expect;
+const sinon = require('sinon');
+const { mockClient } = require('aws-sdk-client-mock');
+const { S3, GetObjectCommand } = require('@aws-sdk/client-s3');
+const lambda = require('../index.js');
 
-// Mock AWS SDK clients
-jest.mock('@aws-sdk/client-s3');
-jest.mock('@aws-sdk/client-dynamodb');
-jest.mock('@aws-sdk/lib-dynamodb');
-jest.mock('@aws-sdk/client-sns');
+const s3Mock = mockClient(S3);
 
-const mockS3Send = jest.fn();
-const mockDynamoSend = jest.fn();
-const mockSNSSend = jest.fn();
-
-jest.mock('@aws-sdk/client-s3', () => ({
-    S3Client: jest.fn(() => ({
-        send: mockS3Send
-    })),
-    GetObjectCommand: jest.fn()
-}));
-
-jest.mock('@aws-sdk/client-dynamodb', () => ({
-    DynamoDBClient: jest.fn()
-}));
-
-jest.mock('@aws-sdk/lib-dynamodb', () => ({
-    DynamoDBDocumentClient: {
-        from: jest.fn(() => ({
-            send: mockDynamoSend
-        }))
-    },
-    UpdateCommand: jest.fn()
-}));
-
-jest.mock('@aws-sdk/client-sns', () => ({
-    SNSClient: jest.fn(() => ({
-        send: mockSNSSend
-    })),
-    PublishCommand: jest.fn()
-}));
-
-// Mock error handler
-jest.mock('../lib/error', () => ({
-    handler: jest.fn()
-}));
-
-describe('Subtitle Configuration Lambda', () => {
+describe('subtitle-config', () => {
+    
     beforeEach(() => {
-        jest.clearAllMocks();
+        s3Mock.reset();
         
         // Set up environment variables
-        process.env.AWS_REGION = 'us-east-1';
         process.env.SOLUTION_IDENTIFIER = 'test-solution';
-        process.env.DynamoDBTable = 'test-table';
         process.env.SUBTITLE_PROCESSING_ENABLED = 'true';
         process.env.SUBTITLE_PRIMARY_LANGUAGE = 'auto';
         process.env.SUBTITLE_TARGET_LANGUAGES = 'en,es,fr';
+        process.env.Source = 'test-source-bucket';
+        process.env.CloudFront = 'test.cloudfront.net';
     });
 
     afterEach(() => {
+        sinon.restore();
         delete process.env.SUBTITLE_PROCESSING_ENABLED;
         delete process.env.SUBTITLE_PRIMARY_LANGUAGE;
         delete process.env.SUBTITLE_TARGET_LANGUAGES;
+        delete process.env.Source;
+        delete process.env.CloudFront;
+        delete process.env.TEMP_BUCKET;
     });
-
-    describe('Configuration Building', () => {
-        test('should build configuration from environment variables', () => {
-            const config = buildSubtitleConfig();
+    
+    describe('handler', () => {
+        
+        it('should return event with valid subtitle configuration for supported video format', async () => {
+            const event = {
+                guid: 'test-guid-123',
+                srcVideo: 'test-video.mp4',
+                srcBucket: 'test-bucket',
+                destBucket: 'dest-bucket'
+            };
             
-            expect(config).toEqual({
-                enabled: true,
-                primaryLanguage: 'auto',
-                targetLanguages: ['en', 'es', 'fr']
-            });
+            const result = await lambda.handler(event);
+            
+            expect(result.guid).to.equal(event.guid);
+            expect(result.srcVideo).to.equal(event.srcVideo);
+            expect(result.subtitleConfig).to.exist;
+            expect(result.subtitleConfig.enabled).to.be.true;
+            expect(result.subtitleConfig.primaryLanguage).to.equal('auto');
+            expect(result.subtitleConfig.targetLanguages).to.deep.equal(['en', 'es', 'fr']);
+            expect(result.subtitleConfig.tempBucket).to.equal('test-bucket');
+            expect(result.subtitleConfig.tempPrefix).to.equal('test-guid-123/subtitles/temp/');
+            expect(result.subtitleConfig.finalPrefix).to.equal('test-guid-123/subtitles/');
         });
 
-        test('should apply metadata overrides', () => {
-            const overrides = {
+        it('should disable subtitle processing for unsupported video format', async () => {
+            const event = {
+                guid: 'test-guid-123',
+                srcVideo: 'test-video.avi', // Unsupported format
+                srcBucket: 'test-bucket'
+            };
+            
+            const result = await lambda.handler(event);
+            
+            expect(result.subtitleConfig.enabled).to.be.false;
+            expect(result.subtitleConfig.reason).to.equal('unsupported_video_format');
+        });
+
+        it('should apply metadata file overrides when metadata file exists', async () => {
+            const metadataContent = JSON.stringify({
                 subtitleEnabled: false,
                 subtitlePrimaryLanguage: 'en',
-                subtitleTargetLanguages: ['es', 'fr']
-            };
-            
-            const config = buildSubtitleConfig(overrides);
-            
-            expect(config).toEqual({
-                enabled: false,
-                primaryLanguage: 'en',
-                targetLanguages: ['es', 'fr']
+                subtitleTargetLanguages: 'es,fr,de'
             });
-        });
 
-        test('should handle string target languages', () => {
-            const overrides = {
-                subtitleTargetLanguages: 'en,es,fr,de'
-            };
-            
-            const config = buildSubtitleConfig(overrides);
-            
-            expect(config.targetLanguages).toEqual(['en', 'es', 'fr', 'de']);
-        });
-    });
-
-    describe('Configuration Validation', () => {
-        test('should validate correct configuration', () => {
-            const config = {
-                enabled: true,
-                primaryLanguage: 'en',
-                targetLanguages: ['es', 'fr']
-            };
-            
-            const result = validateAndNormalizeSubtitleConfig(config);
-            
-            expect(result.isValid).toBe(true);
-            expect(result.errors).toHaveLength(0);
-            expect(result.config).toEqual(config);
-        });
-
-        test('should normalize boolean strings', () => {
-            const config = {
-                enabled: 'true',
-                primaryLanguage: 'en',
-                targetLanguages: ['es']
-            };
-            
-            const result = validateAndNormalizeSubtitleConfig(config);
-            
-            expect(result.isValid).toBe(true);
-            expect(result.config.enabled).toBe(true);
-        });
-
-        test('should handle invalid language codes', () => {
-            const config = {
-                enabled: true,
-                primaryLanguage: 'invalid',
-                targetLanguages: ['es', 'invalid-lang']
-            };
-            
-            const result = validateAndNormalizeSubtitleConfig(config);
-            
-            expect(result.isValid).toBe(false);
-            expect(result.errors).toContain("Unsupported primary language: 'invalid'");
-            expect(result.errors).toContain('Unsupported target languages: invalid-lang');
-        });
-
-        test('should normalize language codes to lowercase', () => {
-            const config = {
-                enabled: true,
-                primaryLanguage: 'EN',
-                targetLanguages: ['ES', 'FR']
-            };
-            
-            const result = validateAndNormalizeSubtitleConfig(config);
-            
-            expect(result.isValid).toBe(true);
-            expect(result.config.primaryLanguage).toBe('en');
-            expect(result.config.targetLanguages).toEqual(['es', 'fr']);
-        });
-    });
-
-    describe('Error Reporting', () => {
-        test('should create configuration error report', () => {
-            const errorReport = createSubtitleErrorReport(
-                SUBTITLE_ERROR_TYPES.CONFIGURATION_ERROR,
-                'Invalid configuration',
-                { guid: 'test-guid', stage: 'configuration' }
-            );
-            
-            expect(errorReport.errorType).toBe(SUBTITLE_ERROR_TYPES.CONFIGURATION_ERROR);
-            expect(errorReport.errorMessage).toBe('Invalid configuration');
-            expect(errorReport.severity).toBe('HIGH');
-            expect(errorReport.retryable).toBe(false);
-            expect(errorReport.userActionRequired).toBe(true);
-            expect(errorReport.context.guid).toBe('test-guid');
-        });
-
-        test('should create transcription error report', () => {
-            const errorReport = createSubtitleErrorReport(
-                SUBTITLE_ERROR_TYPES.TRANSCRIPTION_ERROR,
-                'Transcription failed',
-                { guid: 'test-guid', stage: 'transcription' }
-            );
-            
-            expect(errorReport.errorType).toBe(SUBTITLE_ERROR_TYPES.TRANSCRIPTION_ERROR);
-            expect(errorReport.severity).toBe('MEDIUM');
-            expect(errorReport.retryable).toBe(true);
-            expect(errorReport.userActionRequired).toBe(false);
-        });
-    });
-
-    describe('Lambda Handler', () => {
-        test('should process valid configuration successfully', async () => {
-            // Mock DynamoDB update
-            mockDynamoSend.mockResolvedValue({});
-            
-            const event = {
-                guid: 'test-guid-123',
-                srcBucket: 'test-bucket',
-                destBucket: 'test-dest-bucket'
-            };
-            
-            const result = await handler(event);
-            
-            expect(result.guid).toBe('test-guid-123');
-            expect(result.subtitleConfig).toBeDefined();
-            expect(result.subtitleConfig.enabled).toBe(true);
-            expect(result.configurationResult.isValid).toBe(true);
-            expect(mockDynamoSend).toHaveBeenCalled();
-        });
-
-        test('should handle missing GUID', async () => {
-            const event = {};
-            
-            await expect(handler(event)).rejects.toThrow('Missing required parameter: guid');
-        });
-
-        test('should load metadata overrides from S3', async () => {
-            // Mock S3 response
-            const mockMetadata = {
-                subtitleEnabled: false,
-                subtitlePrimaryLanguage: 'es',
-                subtitleTargetLanguages: ['en', 'fr']
-            };
-            
-            mockS3Send.mockResolvedValue({
+            s3Mock.on(GetObjectCommand).resolves({
                 Body: {
-                    [Symbol.asyncIterator]: async function* () {
-                        yield Buffer.from(JSON.stringify(mockMetadata));
-                    }
+                    transformToString: () => Promise.resolve(metadataContent)
                 }
             });
-            
-            mockDynamoSend.mockResolvedValue({});
-            
+
             const event = {
                 guid: 'test-guid-123',
+                srcVideo: 'test-video.mp4',
                 srcBucket: 'test-bucket',
-                srcMetadataFile: 'metadata.json',
-                destBucket: 'test-dest-bucket'
+                srcMetadataFile: 'metadata.json'
             };
             
-            const result = await handler(event);
+            const result = await lambda.handler(event);
             
-            expect(result.subtitleConfig.enabled).toBe(false);
-            expect(result.subtitleConfig.primaryLanguage).toBe('es');
-            expect(result.subtitleConfig.targetLanguages).toEqual(['en', 'fr']);
-            expect(result.configurationResult.metadataOverrides).toBeDefined();
+            expect(result.subtitleConfig.enabled).to.be.false;
+            expect(result.subtitleConfig.primaryLanguage).to.equal('en');
+            expect(result.subtitleConfig.targetLanguages).to.deep.equal(['es', 'fr', 'de']);
         });
 
-        test('should handle S3 metadata loading errors gracefully', async () => {
-            // Mock S3 error
-            mockS3Send.mockRejectedValue(new Error('S3 access denied'));
-            mockDynamoSend.mockResolvedValue({});
-            
+        it('should handle metadata file loading errors gracefully', async () => {
+            s3Mock.on(GetObjectCommand).rejects(new Error('File not found'));
+
             const event = {
                 guid: 'test-guid-123',
+                srcVideo: 'test-video.mp4',
                 srcBucket: 'test-bucket',
-                srcMetadataFile: 'metadata.json',
-                destBucket: 'test-dest-bucket'
+                srcMetadataFile: 'nonexistent.json'
             };
             
-            const result = await handler(event);
+            const result = await lambda.handler(event);
             
-            // Should still succeed with default configuration
-            expect(result.subtitleConfig.enabled).toBe(true);
-            expect(result.configurationResult.isValid).toBe(true);
+            // Should fall back to environment configuration
+            expect(result.subtitleConfig.enabled).to.be.true;
+            expect(result.subtitleConfig.primaryLanguage).to.equal('auto');
         });
 
-        test('should handle configuration validation errors', async () => {
-            // Set invalid environment configuration
-            process.env.SUBTITLE_PRIMARY_LANGUAGE = 'invalid-lang';
-            
-            mockDynamoSend.mockResolvedValue({});
-            
+        it('should apply event overrides over metadata and environment', async () => {
+            const metadataContent = JSON.stringify({
+                subtitleEnabled: true,
+                subtitlePrimaryLanguage: 'en'
+            });
+
+            s3Mock.on(GetObjectCommand).resolves({
+                Body: {
+                    transformToString: () => Promise.resolve(metadataContent)
+                }
+            });
+
             const event = {
                 guid: 'test-guid-123',
+                srcVideo: 'test-video.mp4',
                 srcBucket: 'test-bucket',
-                destBucket: 'test-dest-bucket'
+                srcMetadataFile: 'metadata.json',
+                subtitleEnabled: false, // Event override
+                subtitleTargetLanguages: 'ja,ko' // Event override
             };
             
-            const result = await handler(event);
+            const result = await lambda.handler(event);
             
-            // Should disable subtitle processing for non-critical errors
-            expect(result.subtitleConfig.enabled).toBe(false);
-            expect(result.configurationResult.isValid).toBe(false);
-            expect(result.configurationResult.errors.length).toBeGreaterThan(0);
+            expect(result.subtitleConfig.enabled).to.be.false; // From event override
+            expect(result.subtitleConfig.targetLanguages).to.deep.equal(['ja', 'ko']); // From event override
         });
+
+        it('should disable subtitle processing for invalid configuration', async () => {
+            const event = {
+                guid: 'test-guid-123',
+                srcVideo: 'test-video.mp4',
+                srcBucket: 'test-bucket',
+                subtitleTargetLanguages: 'invalid-lang,another-invalid' // Invalid languages
+            };
+            
+            const result = await lambda.handler(event);
+            
+            expect(result.subtitleConfig.enabled).to.be.false;
+            expect(result.subtitleConfig.reason).to.equal('configuration_error');
+            expect(result.subtitleConfig.errors).to.exist;
+        });
+
+        it('should handle missing required fields', async () => {
+            const event = {
+                // Missing guid
+                srcVideo: 'test-video.mp4',
+                srcBucket: 'test-bucket'
+            };
+            
+            try {
+                await lambda.handler(event);
+                expect.fail('Should have thrown an error');
+            } catch (error) {
+                expect(error.message).to.include('Missing required field: guid');
+            }
+        });
+
+        it('should use environment defaults when no overrides provided', async () => {
+            process.env.SUBTITLE_PROCESSING_ENABLED = 'false';
+            process.env.SUBTITLE_PRIMARY_LANGUAGE = 'es';
+            process.env.SUBTITLE_TARGET_LANGUAGES = 'en,fr';
+
+            const event = {
+                guid: 'test-guid-123',
+                srcVideo: 'test-video.mp4',
+                srcBucket: 'test-bucket'
+            };
+            
+            const result = await lambda.handler(event);
+            
+            expect(result.subtitleConfig.enabled).to.be.false;
+            expect(result.subtitleConfig.primaryLanguage).to.equal('es');
+            expect(result.subtitleConfig.targetLanguages).to.deep.equal(['en', 'fr']);
+        });
+
+        it('should include CloudFront domain in configuration', async () => {
+            const event = {
+                guid: 'test-guid-123',
+                srcVideo: 'test-video.mp4',
+                srcBucket: 'test-bucket',
+                cloudFront: 'custom.cloudfront.net'
+            };
+            
+            const result = await lambda.handler(event);
+            
+            expect(result.subtitleConfig.cloudFrontDomain).to.equal('custom.cloudfront.net');
+        });
+
+        it('should use temp bucket from environment when specified', async () => {
+            process.env.TEMP_BUCKET = 'custom-temp-bucket';
+
+            const event = {
+                guid: 'test-guid-123',
+                srcVideo: 'test-video.mp4',
+                srcBucket: 'test-bucket'
+            };
+            
+            const result = await lambda.handler(event);
+            
+            expect(result.subtitleConfig.tempBucket).to.equal('custom-temp-bucket');
+        });
+
+        it('should handle malformed metadata JSON gracefully', async () => {
+            s3Mock.on(GetObjectCommand).resolves({
+                Body: {
+                    transformToString: () => Promise.resolve('invalid json content')
+                }
+            });
+
+            const event = {
+                guid: 'test-guid-123',
+                srcVideo: 'test-video.mp4',
+                srcBucket: 'test-bucket',
+                srcMetadataFile: 'invalid.json'
+            };
+            
+            const result = await lambda.handler(event);
+            
+            // Should fall back to environment configuration
+            expect(result.subtitleConfig.enabled).to.be.true;
+            expect(result.subtitleConfig.primaryLanguage).to.equal('auto');
+        });
+        
     });
+    
 });

@@ -11,49 +11,50 @@
  *  and limitations under the License.                                                                                *
  *********************************************************************************************************************/
 
-/**
- * Error handler for translation worker Lambda function
- */
+const { DynamoDBDocument } = require("@aws-sdk/lib-dynamodb");
+const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+const { Lambda } = require("@aws-sdk/client-lambda");
 
-const { SNSClient, PublishCommand } = require("@aws-sdk/client-sns");
+exports.handler = async (event, err) => {
+    console.log(`ERROR:: ${JSON.stringify(err, null, 2)}`);
 
-/**
- * Handles errors by logging and optionally sending notifications
- * @param {Object} event - Lambda event object
- * @param {Error} error - Error object
- */
-exports.handler = async (event, error) => {
-    console.error('Translation Worker Error:', {
-        error: error.message,
-        stack: error.stack,
-        event: JSON.stringify(event, null, 2)
+    const dynamo = DynamoDBDocument.from(new DynamoDBClient({ 
+        region: process.env.AWS_REGION,
+        customUserAgent: process.env.SOLUTION_IDENTIFIER
+    }));
+
+    const lambda = new Lambda({
+        region: process.env.AWS_REGION,
+        customUserAgent: process.env.SOLUTION_IDENTIFIER
     });
 
-    // Send error notification if SNS topic is configured
-    if (process.env.ErrorHandler) {
-        try {
-            const snsClient = new SNSClient({
-                region: process.env.AWS_REGION,
-                customUserAgent: process.env.SOLUTION_IDENTIFIER
-            });
+    try {
+        // Update DynamoDB with error status
+        let params = {
+            TableName: process.env.DynamoDBTable,
+            Key: {
+                guid: event.guid,
+            },
+            UpdateExpression: 'set workflowStatus = :status, errorMessage = :error',
+            ExpressionAttributeValues: {
+                ':status': 'Error',
+                ':error': err.message
+            }
+        };
 
-            const message = {
-                source: 'translation-worker',
-                guid: event.guid || 'unknown',
-                error: error.message,
-                timestamp: new Date().toISOString()
+        await dynamo.update(params);
+
+        // Send error notification
+        if (process.env.ErrorHandler) {
+            params = {
+                FunctionName: process.env.ErrorHandler,
+                Payload: JSON.stringify(event, null, 2)
             };
 
-            const params = {
-                TopicArn: process.env.ErrorHandler,
-                Message: JSON.stringify(message),
-                Subject: 'Translation Worker Error'
-            };
-
-            await snsClient.send(new PublishCommand(params));
-            console.log('Error notification sent to SNS');
-        } catch (snsError) {
-            console.error('Failed to send error notification:', snsError);
+            await lambda.invoke(params);
         }
+
+    } catch (error) {
+        console.log(error);
     }
 };
