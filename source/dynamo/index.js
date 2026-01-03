@@ -16,7 +16,6 @@ const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 const { S3 } = require("@aws-sdk/client-s3");
 const error = require('./lib/error.js');
 const { 
-    createSubtitleProcessingUpdate,
     updateTranscriptionStatus,
     updateTranslationStatus,
     updateWebVTTStatus,
@@ -24,8 +23,7 @@ const {
     updateMediaConvertCompletion,
     getSubtitleProcessingStatus,
     updateSubtitleError,
-    updatePerformanceMetrics,
-    SUBTITLE_DB_FIELDS
+    updatePerformanceMetrics
 } = require('./lib/subtitle-db-utils.js');
 
 exports.handler = async (event) => {
@@ -117,7 +115,6 @@ async function handleStandardUpdate(dynamo, event) {
     
     let expression = '';
     let values = {};
-    let names = {};
     let i = 0;
 
     // Helper function to check if a key contains nested attributes

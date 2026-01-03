@@ -233,47 +233,7 @@ function generateWebVTTFilename(videoFilename, languageCode) {
     return `${baseName}.${languageCode.toLowerCase()}.vtt`;
 }
 
-/**
- * Validates subtitle processing configuration
- * @param {Object} config - Subtitle configuration object
- * @returns {Object} Validation result with isValid boolean and errors array
- */
-function validateSubtitleConfig(config) {
-    const errors = [];
-    
-    if (!config || typeof config !== 'object') {
-        return { isValid: false, errors: ['Configuration must be an object'] };
-    }
-    
-    // Validate enabled flag
-    if (typeof config.enabled !== 'boolean') {
-        errors.push('enabled must be a boolean');
-    }
-    
-    // Validate primary language
-    if (config.primaryLanguage && config.primaryLanguage !== 'auto') {
-        if (!isLanguageSupported(config.primaryLanguage)) {
-            errors.push(`Primary language '${config.primaryLanguage}' is not supported`);
-        }
-    }
-    
-    // Validate target languages
-    if (config.targetLanguages) {
-        if (!Array.isArray(config.targetLanguages)) {
-            errors.push('targetLanguages must be an array');
-        } else {
-            const invalidLanguages = config.targetLanguages.filter(lang => !isLanguageSupported(lang));
-            if (invalidLanguages.length > 0) {
-                errors.push(`Unsupported target languages: ${invalidLanguages.join(', ')}`);
-            }
-        }
-    }
-    
-    return {
-        isValid: errors.length === 0,
-        errors
-    };
-}
+// validateSubtitleConfig removed - superseded by validateAndNormalizeSubtitleConfig
 
 /**
  * Builds subtitle configuration from environment variables and metadata overrides
@@ -575,92 +535,11 @@ function createSubtitleStatusUpdate(status, additionalFields = {}) {
     return result;
 }
 
-/**
- * Creates a DynamoDB update expression for transcription status
- * @param {string} status - Transcription status
- * @param {Object} transcriptionData - Transcription job data
- * @returns {Object} DynamoDB update parameters
- */
-function createTranscriptionStatusUpdate(status, transcriptionData = {}) {
-    const additionalFields = {
-        transcriptionStatus: status,
-        ...transcriptionData
-    };
+// createTranscriptionStatusUpdate removed - not used in actual code, only in backup files
 
-    // Determine overall subtitle processing status based on transcription status
-    let overallStatus = SUBTITLE_STATUS.TRANSCRIBING;
-    if (status === 'COMPLETED') {
-        overallStatus = SUBTITLE_STATUS.COMPLETED;
-    } else if (status === 'FAILED' || status === 'failed') {
-        overallStatus = SUBTITLE_STATUS.FAILED;
-    }
+// createTranslationStatusUpdate removed - not used in actual code
 
-    return createSubtitleStatusUpdate(overallStatus, additionalFields);
-}
-
-/**
- * Creates a DynamoDB update expression for translation status
- * @param {string} status - Translation status
- * @param {Object} translationData - Translation job data
- * @returns {Object} DynamoDB update parameters
- */
-function createTranslationStatusUpdate(status, translationData = {}) {
-    const additionalFields = {
-        translationStatus: status,
-        ...translationData
-    };
-
-    return createSubtitleStatusUpdate(SUBTITLE_STATUS.TRANSLATING, additionalFields);
-}
-
-/**
- * Creates a DynamoDB update expression for WebVTT generation status
- * @param {string} status - WebVTT generation status
- * @param {Array} uploadedFiles - Array of uploaded file information
- * @param {string} errorDetails - Error details if failed
- * @returns {Object} DynamoDB update parameters
- */
-function createWebVTTStatusUpdate(status, uploadedFiles = null, errorDetails = null) {
-    const additionalFields = {
-        webvttStatus: status,
-        webvttTimestamp: new Date().toISOString()
-    };
-
-    // Add file information if provided
-    if (uploadedFiles && Array.isArray(uploadedFiles)) {
-        const subtitleFiles = {};
-        const cloudFrontUrls = {};
-        
-        uploadedFiles.forEach(file => {
-            subtitleFiles[file.language] = file.s3Location;
-            if (file.cloudFrontUrl) {
-                cloudFrontUrls[file.language] = file.cloudFrontUrl;
-            }
-        });
-
-        additionalFields.subtitleFiles = subtitleFiles;
-        if (Object.keys(cloudFrontUrls).length > 0) {
-            additionalFields.cloudFrontUrls = cloudFrontUrls;
-        }
-        additionalFields.fileCount = uploadedFiles.length;
-        additionalFields.languages = uploadedFiles.map(file => file.language);
-    }
-
-    // Add error details if provided
-    if (errorDetails) {
-        additionalFields.webvttError = errorDetails;
-    }
-
-    // Determine overall status
-    let overallStatus = SUBTITLE_STATUS.GENERATING;
-    if (status === WEBVTT_STATUS.COMPLETED) {
-        overallStatus = SUBTITLE_STATUS.COMPLETED;
-    } else if (status === WEBVTT_STATUS.FAILED) {
-        overallStatus = SUBTITLE_STATUS.FAILED;
-    }
-
-    return createSubtitleStatusUpdate(overallStatus, additionalFields);
-}
+// createWebVTTStatusUpdate removed - not used in actual code
 
 /**
  * Creates a comprehensive error report for subtitle processing failures
@@ -1030,7 +909,6 @@ module.exports = {
     isLanguageSupported,
     generateTranscriptionJobName,
     generateWebVTTFilename,
-    validateSubtitleConfig,
     buildSubtitleConfig,
     validateAndNormalizeSubtitleConfig,
     formatWebVTTTimestamp,
@@ -1038,9 +916,6 @@ module.exports = {
     generateCloudFrontUrl,
     generateSubtitleS3Key,
     createSubtitleStatusUpdate,
-    createTranscriptionStatusUpdate,
-    createTranslationStatusUpdate,
-    createWebVTTStatusUpdate,
     createSubtitleErrorReport,
     logSubtitleError,
     shouldFailWorkflow,

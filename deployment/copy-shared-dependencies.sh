@@ -4,6 +4,10 @@
 # This ensures that when Lambda functions are packaged individually, they have
 # access to the shared utilities they import.
 #
+# NOTE: This script has been updated to work with minimal service-specific utilities.
+# Each service now has its own minimal utility files, so we only copy files that
+# don't already exist locally.
+#
 
 set -e
 
@@ -11,44 +15,65 @@ set -e
 source_dir="$(dirname "$0")/../source"
 
 echo "------------------------------------------------------------------------------"
-echo "[Copy Shared Dependencies] Copying shared utilities to Lambda functions"
+echo "[Copy Shared Dependencies] Checking for missing dependencies in Lambda functions"
 echo "------------------------------------------------------------------------------"
 
-# List of Lambda functions that need subtitle-utils.js
+# List of Lambda functions that might need shared dependencies
 subtitle_functions=(
     "subtitle-config"
     "transcription"
     "translation-coordinator"
     "translation-worker"
     "webvtt-generator"
+    "encode"
 )
 
-# Copy shared files to each function that needs them
+# Function to copy file only if it doesn't exist locally
+copy_if_missing() {
+    local func_dir="$1"
+    local shared_file="$2"
+    local target_file="$3"
+    
+    if [ ! -f "$func_dir/$target_file" ]; then
+        if [ -f "$source_dir/shared/$shared_file" ]; then
+            echo "  Copying missing $shared_file to $func_dir"
+            cp "$source_dir/shared/$shared_file" "$func_dir/$target_file"
+        else
+            echo "  Warning: Shared file $shared_file not found"
+        fi
+    else
+        echo "  Local $target_file already exists, skipping copy"
+    fi
+}
+
+# Check each function directory
 for func in "${subtitle_functions[@]}"; do
     if [ -d "$source_dir/$func" ]; then
-        echo "Copying shared files to $func"
-        cp "$source_dir/shared/subtitle-utils.js" "$source_dir/$func/"
-        cp "$source_dir/shared/subtitle-error-handler.js" "$source_dir/$func/"
-        cp "$source_dir/shared/s3-storage-utils.js" "$source_dir/$func/"
+        echo "Checking dependencies for $func"
         
-        # Copy additional shared files based on function needs
+        # Only copy files that don't already exist locally
+        # This preserves the minimal utility files we created
+        copy_if_missing "$source_dir/$func" "subtitle-utils.js" "subtitle-utils.js"
+        copy_if_missing "$source_dir/$func" "subtitle-error-handler.js" "subtitle-error-handler.js"
+        copy_if_missing "$source_dir/$func" "s3-storage-utils.js" "s3-storage-utils.js"
+        
+        # Copy additional shared files based on function needs (only if missing)
         case $func in
             "transcription")
-                cp "$source_dir/shared/dynamo-subtitle-client.js" "$source_dir/$func/"
-                cp "$source_dir/shared/performance-optimizer.js" "$source_dir/$func/"
-                cp "$source_dir/shared/notification-integration.js" "$source_dir/$func/"
+                copy_if_missing "$source_dir/$func" "dynamo-subtitle-client.js" "dynamo-subtitle-client.js"
+                copy_if_missing "$source_dir/$func" "performance-optimizer.js" "performance-optimizer.js"
+                copy_if_missing "$source_dir/$func" "notification-integration.js" "notification-integration.js"
                 ;;
             "translation-coordinator")
-                cp "$source_dir/shared/subtitle-types.js" "$source_dir/$func/"
-                cp "$source_dir/shared/performance-optimizer.js" "$source_dir/$func/"
-                cp "$source_dir/shared/notification-integration.js" "$source_dir/$func/"
+                copy_if_missing "$source_dir/$func" "subtitle-types.js" "subtitle-types.js"
+                copy_if_missing "$source_dir/$func" "performance-optimizer.js" "performance-optimizer.js"
+                copy_if_missing "$source_dir/$func" "notification-integration.js" "notification-integration.js"
                 ;;
             "translation-worker")
-                cp "$source_dir/shared/subtitle-types.js" "$source_dir/$func/"
+                copy_if_missing "$source_dir/$func" "subtitle-types.js" "subtitle-types.js"
                 ;;
             "webvtt-generator")
-                cp "$source_dir/shared/subtitle-types.js" "$source_dir/$func/"
-                cp "$source_dir/shared/s3-storage-utils.js" "$source_dir/$func/"
+                copy_if_missing "$source_dir/$func" "subtitle-types.js" "subtitle-types.js"
                 ;;
         esac
     else
@@ -56,13 +81,6 @@ for func in "${subtitle_functions[@]}"; do
     fi
 done
 
-# Also copy shared files to encode function
-if [ -d "$source_dir/encode" ]; then
-    echo "Copying shared files to encode"
-    cp "$source_dir/shared/subtitle-utils.js" "$source_dir/encode/"
-    cp "$source_dir/shared/s3-storage-utils.js" "$source_dir/encode/"
-fi
-
 echo "------------------------------------------------------------------------------"
-echo "[Copy Shared Dependencies] Complete"
+echo "[Copy Shared Dependencies] Complete - Minimal utilities preserved"
 echo "------------------------------------------------------------------------------"
